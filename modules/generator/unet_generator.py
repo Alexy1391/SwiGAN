@@ -20,6 +20,8 @@ class UNetGenerator(nn.Module):
         dropout: float,
         normalization: str | None = "batchnorm",
         apply_center_block: bool = False,
+        noise_weight_init: str = "randn",
+        encoder_late_dropout: float = 0.0,
     ) -> None:
         """Initialize arguments."""
         super().__init__()
@@ -29,6 +31,8 @@ class UNetGenerator(nn.Module):
             dropout=dropout,
             normalization=normalization,
             apply_center_block=apply_center_block,
+            noise_weight_init=noise_weight_init,
+            encoder_late_dropout=encoder_late_dropout,
         )
 
         self.decoder = UNetFrameDecoder(
@@ -38,6 +42,7 @@ class UNetGenerator(nn.Module):
             decoder_channels=decoder_channels,
             dropout=dropout,
             normalization=normalization,
+            noise_weight_init=noise_weight_init,
         )
         self.noise_dim = noise_dim
 

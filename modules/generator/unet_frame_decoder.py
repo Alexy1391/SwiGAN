@@ -10,7 +10,7 @@ from torchvision.ops import stochastic_depth
 
 from modules.base_conv_blocks import single_conv_block
 from modules.scse import SCSEModule
-from modules.utils import glorot_init
+from modules.utils import glorot_init, init_noise_weights
 
 
 class UNetDecoderBlock(nn.Module):
@@ -28,6 +28,7 @@ class UNetDecoderBlock(nn.Module):
         normalization: str | None,
         prob: float = 1.0,
         additional_pad: tuple[int, ...] | None = None,
+        noise_weight_init: str = "randn",
     ) -> None:
         """Initialize the input parameters.
 
@@ -45,6 +46,8 @@ class UNetDecoderBlock(nn.Module):
             prob: Survival probability for stochastic depth.
             additional_pad: Additional padding to apply to the input to match the
                 skip input.
+            noise_weight_init: How to initialize the per-channel noise gains. See
+                ``modules.utils.init_noise_weights``.
 
         """
         super().__init__()
@@ -82,8 +85,8 @@ class UNetDecoderBlock(nn.Module):
             padding=1,
         )
         self.attention = SCSEModule(in_channels=out_channels)
-        self.noise_weights1 = nn.Parameter(torch.randn(out_channels))
-        self.noise_weights2 = nn.Parameter(torch.randn(out_channels))
+        self.noise_weights1 = init_noise_weights(out_channels, noise_weight_init)
+        self.noise_weights2 = init_noise_weights(out_channels, noise_weight_init)
         self.prob = prob
         self.additional_pad = additional_pad
 
@@ -136,6 +139,7 @@ class UNetFrameDecoder(nn.Module):
         decoder_channels: list[int],
         dropout: float = 0.3,
         normalization: str | None = "batchnorm",
+        noise_weight_init: str = "randn",
     ) -> None:
         """Initialize input parameters.
 
@@ -149,6 +153,8 @@ class UNetFrameDecoder(nn.Module):
             normalization: normalization: The type of normalization to apply.
                 If None, no normalization is applied. Supported normalization are
                 "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2D.
+            noise_weight_init: How to initialize the per-channel noise gains. See
+                ``modules.utils.init_noise_weights``.
 
         """
         super().__init__()
@@ -171,6 +177,7 @@ class UNetFrameDecoder(nn.Module):
                 normalization=normalization,
                 prob=self.probs[i],
                 additional_pad=(1, 0, 1, 0) if i == 0 else None,  # Needed to harmonize the shapes
+                noise_weight_init=noise_weight_init,
             )
             for i in range(len(in_channels))
         ]

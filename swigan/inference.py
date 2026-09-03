@@ -13,7 +13,11 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from swigan.engines.swigan_lit import TTTSWIGAN
-from utils.preprocessing import dataframe_to_rasters, fill_all_missing_pixels
+from utils.preprocessing import (
+    coerce_comma_decimal_columns,
+    dataframe_to_rasters,
+    fill_all_missing_pixels,
+)
 
 logger = logging.getLogger(__file__)
 
@@ -27,21 +31,29 @@ def compute_trajectory_iterative(
     z: torch.Tensor,
     dtype: np.dtype,
 ) -> np.ndarray:
-    """Predict iteratively n timestamps k timesteps at a time."""
-    target_maps = starting_target_maps.unsqueeze(0).repeat(len(z), 1, 1, 1)
+    """Predict iteratively n timestamps k timesteps at a time.
+
+    ``z`` carries one independent noise draw per rollout step, of shape
+    (num_steps, num_trajectories, z_dim). Step k is generated from ``z[k]``, following the
+    iterative procedure of Section 2.2 of the paper: the Z_k are i.i.d. across k, so a
+    trajectory's deviations do not share a single fixed noise vector across all 24 months.
+    """
+    num_trajectories = z.shape[1]
+    target_maps = starting_target_maps.unsqueeze(0).repeat(num_trajectories, 1, 1, 1)
     outputs = []
     with torch.no_grad():
         for idx in range(0, len(inputs_maps)):
             inputs = torch.cat(
-                [inputs_maps[idx].unsqueeze(0).repeat(len(z), 1, 1, 1), target_maps], dim=1
+                [inputs_maps[idx].unsqueeze(0).repeat(num_trajectories, 1, 1, 1), target_maps],
+                dim=1,
             )
-            timestamps = input_timestamps[idx].unsqueeze(0).repeat(len(z))
+            timestamps = input_timestamps[idx].unsqueeze(0).repeat(num_trajectories)
 
             current_output = model(
                 inputs.to(inputs_maps.device),
                 timestamps.to(inputs_maps.device),
                 mask.unsqueeze(0).to(inputs_maps.device),
-                z.to(inputs_maps.device),
+                z[idx].to(inputs_maps.device),
             )
             target_maps = torch.cat([target_maps, current_output], dim=1)[:, 1:]
             outputs.append(current_output.unsqueeze(1))
@@ -119,6 +131,11 @@ def main(cfg: DictConfig) -> None:
     input_dataset = input_dataset.drop(columns=columns_to_drop)
     starting_dataset = starting_dataset.drop(columns=columns_to_drop)
 
+    input_dataset = coerce_comma_decimal_columns(input_dataset, [*feature_columns, target_column])
+    starting_dataset = coerce_comma_decimal_columns(
+        starting_dataset, [*feature_columns, target_column]
+    )
+
     # Load the model from the checkpoint
     if not os.path.exists(model_cfg["checkpoint_path"]):
         raise ValueError(f"No checkpoints found at '{model_cfg['checkpoint_path']}'")
@@ -129,6 +146,12 @@ def main(cfg: DictConfig) -> None:
     )
     train_dataset_statistics = np.load(model_cfg["train_dataset_statistics_path"])
     model.statistics = train_dataset_statistics
+
+    # ``load_from_checkpoint`` returns the module in train mode. Free-running inference must
+    # run in eval mode, otherwise stochastic depth randomly drops residual blocks and
+    # BatchNorm uses the statistics of the batch of fed-back predictions at every one of the
+    # rollout steps ("During inference, all residual blocks are used", paper Section 8.2.1).
+    model.eval()
 
     # Extract features
     map_height, map_width = model.hparams.input_map_dims
@@ -150,14 +173,17 @@ def main(cfg: DictConfig) -> None:
     feature_maps = (feature_maps - mean_value) / std_value
     feature_maps = np.where(mask.squeeze(), feature_maps, 0.0)
 
-    # Compute the trajectories
-    z = torch.randn(model_cfg["num_trajectories"], model.hparams.z_dim) * model_cfg["noise_std"]
+    # Compute the trajectories. The Z_k of Section 2.2 are i.i.d. across rollout steps, so
+    # draw one noise vector per step and per trajectory: (num_steps, num_trajectories, z_dim).
+    num_trajectories = model_cfg["num_trajectories"]
+    num_steps = len(feature_maps)
+    z = torch.randn(num_steps, num_trajectories, model.hparams.z_dim) * model_cfg["noise_std"]
 
     trajectories = []
     batch_size = model_cfg["num_trajectories_per_batch"]
-    logger.info(f"Running inference for {model_cfg['num_trajectories']} trajectories...")
-    for idx in tqdm(range(0, len(z), batch_size)):
-        z_vec = z[idx : idx + batch_size].to(device)
+    logger.info(f"Running inference for {num_trajectories} trajectories...")
+    for idx in tqdm(range(0, num_trajectories, batch_size)):
+        z_vec = z[:, idx : idx + batch_size].to(device)
         traj = compute_trajectory_iterative(
             model=model,
             inputs_maps=torch.tensor(feature_maps * mask.squeeze(), device=device).float(),

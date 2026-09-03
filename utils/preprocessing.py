@@ -4,6 +4,16 @@ import numpy as np
 import pandas as pd
 
 
+def coerce_comma_decimal_columns(input_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Coerce numeric columns stored as comma-decimal strings (e.g. "0,564") to floats."""
+    for col in columns:
+        if input_df[col].dtype == object:
+            input_df[col] = pd.to_numeric(
+                input_df[col].astype(str).str.replace(",", ".", regex=False), errors="coerce"
+            )
+    return input_df
+
+
 def dataframe_to_rasters(
     input_df: pd.DataFrame,
     target_cols: str,
@@ -19,6 +29,7 @@ def dataframe_to_rasters(
     input_df = input_df.sort_values(["year", "month", y_dim_col, x_dim_col])
 
     input_maps, target_maps, timestamps = [], [], []
+    mask = None
 
     input_df.sort_values(["year", "month", y_dim_col, x_dim_col], inplace=True)
 
@@ -39,10 +50,12 @@ def dataframe_to_rasters(
             target_maps.append(y_i.astype(np.float32))
             timestamps.append(t_vec)
 
+            if mask is None:
+                mask = sub_df["mask"].values.reshape(1, height, width)
+
     input_maps = np.stack(input_maps, axis=0)
     target_maps = np.stack(target_maps, axis=0)
     timestamps = np.stack(timestamps, axis=0).astype(np.float32)
-    mask = sub_df["mask"].values.reshape(1, height, width)
 
     return input_maps, target_maps, timestamps, mask
 

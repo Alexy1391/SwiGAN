@@ -16,6 +16,7 @@ from modules.discriminator.base_discriminator import BaseDiscriminator
 from modules.discriminator.frame_discriminator import FrameDiscriminator
 from modules.discriminator.patch_gan_discriminator import PatchGANDiscriminator
 from modules.generator.unet_generator import UNetGenerator
+from modules.utils import NOISE_WEIGHT_INITS
 
 
 class TTTSWIGAN(LightningModule):
@@ -40,12 +41,20 @@ class TTTSWIGAN(LightningModule):
         loss_fn: nn.Module | str,
         optim: torch.optim.Optimizer,
         normalization: str,
+        patch_critic_loss: str = "hinge",
+        patch_aggregation: str = "mean",
+        gradient_penalty_reduction: str = "sum",
         num_critic_iterations_per_epoch: int = 5,
         lambda_penalty: float = 10.0,
+        lambda_penalty_patch: float | None = None,
+        lambda_penalty_frame: float | None = None,
         image_distance_weight: float = 100.0,
         feature_matching_weight: float = 1.5,
         max_epochs: int = 100,
         min_lr: float = 1e-9,
+        noise_weight_init: str = "randn",
+        noise_weight_lr_scale: float = 1.0,
+        encoder_late_dropout: float = 0.0,
     ) -> None:
         """Initialize the input arguments.
 
@@ -78,9 +87,39 @@ class TTTSWIGAN(LightningModule):
             normalization: normalization: The type of normalization to apply.
                 If None, no normalization is applied. Supported normalization are
                 "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2D.
+            patch_critic_loss: The adversarial loss applied to the patch critic grid.
+                Either "wasserstein" (Eq. 3.5, the unweighted mean of the raw scores)
+                or "hinge" (a per-tile margin loss). Under "wasserstein" the loss is
+                linear in the critic output, so the mean commutes through the 1x1
+                final conv and the whole 4x5 grid collapses to a single linear readout
+                of the globally pooled features. "hinge" scores each tile against its
+                own margin, which keeps the tiles as separate degrees of freedom.
+            patch_aggregation: How the patch critic's tile grid is reduced to the scalar
+                the loss consumes. "mean" is Eq. 3.5's unweighted average, applied in the
+                loss; since the final conv is 1x1 and the WGAN loss is linear, that mean
+                commutes through the conv and the 20 tiles collapse to one linear readout
+                of the globally pooled features. "learned" reduces the grid inside the
+                critic through a non-linear MLP over the tile scores, so the critic is
+                still one scalar function -- duality and the gradient penalty intact --
+                but no longer a linear readout, and each tile gets its own gradient.
+            gradient_penalty_reduction: How the critic grid is reduced to a scalar before
+                differentiating for the gradient penalty. Either "sum" or "mean". "sum"
+                constrains the 20-output patch critic ~20x more tightly than the single
+                output frame critic, so lambda_penalty does not mean the same thing for
+                the two heads; "mean" differentiates the functional the loss consumes.
             num_critic_iterations_per_epoch: Number of critic updates per epoch.
             lambda_penalty: The weight to apply to the gradient penalty of the
-                critic loss.
+                critic loss. Used for whichever of the two per-head weights below is
+                left unset.
+            lambda_penalty_patch: Gradient penalty weight for the patch head only.
+                Defaults to lambda_penalty. Split from the frame head's weight because
+                the two heads' penalties are not the same constraint: the frame critic
+                emits a single value, so "sum" and "mean" reduction agree on it and its
+                weight has meant the same thing in every round, while the patch critic's
+                20 outputs made its weight reduction-dependent. Sweeping one shared
+                weight moves both heads at once.
+            lambda_penalty_frame: Gradient penalty weight for the frame head only.
+                Defaults to lambda_penalty.
             image_distance_weight: The weight to apply to the pixel reconstruction
                 loss term.
             feature_matching_weight: Weight to apply to the feature matching term in the loss.
@@ -91,6 +130,29 @@ class TTTSWIGAN(LightningModule):
                 the scheduler.
             scheduler_threshold: The minimum threshold on the monitored metric over
                 which the learning rate is updated.
+            noise_weight_init: How the 20 per-channel noise gains in the generator's
+                encoder and decoder blocks are initialized. "randn" is what rounds 1-8
+                trained with; "zeros" is StyleGAN's convention, where a block starts as
+                its deterministic self and has to earn any noise it uses. Read
+                ``modules.utils.init_noise_weights`` before choosing: at this run's
+                learning rate the gains move ~1e-3 over 120 epochs against a randn draw
+                at rms 1.0, so the init is closer to a fixed hyperparameter than to a
+                starting point, and "zeros" behaves more like training with injection off
+                than like letting the model find its own noise scale. "randn3" is rms 3.0,
+                which exists only to start the gains ABOVE round 10 arm C's fitted asymptote
+                of 1.489 and see whether they are pulled back down to it; it requires a large
+                ``noise_weight_lr_scale`` to mean anything.
+            encoder_late_dropout: Dropout rate for the last three downsampling blocks only.
+                Paper §8.2.1 prescribes dropout in the last three downsampling and first three
+                upsampling layers, citing Isola et al. [2018] on generators that ignore the
+                noise vector; only the upsampling half was ever implemented. 0.0 is rounds 1-10.
+            noise_weight_lr_scale: Multiplier on the generator learning rate for the noise
+                gains only, applied as a separate AdamW param group. 1.0 reproduces rounds
+                1-8. The gains need their own scale because the shared learning rate is set
+                for Glorot-initialized convs at rms 0.017-0.16; a gain that has to reach
+                O(0.1) to affect the output cannot get there on a ~1e-3 travel budget. At
+                scale 100 that budget becomes ~1e-1, which is the range where the gains can
+                actually settle where the loss wants them rather than where they started.
 
         """
         super().__init__()
@@ -104,12 +166,16 @@ class TTTSWIGAN(LightningModule):
             dropout=spatial_dropout,
             normalization=normalization,
             apply_center_block=apply_center_block,
+            noise_weight_init=noise_weight_init,
+            encoder_late_dropout=encoder_late_dropout,
         )
 
         self.base_critic = BaseDiscriminator(
             input_channels=output_channels, output_channels=[32, 64, 128], mbd_output_channels=64
         )
-        self.patch_critic = PatchGANDiscriminator(input_channels=128 + 64)
+        self.patch_critic = PatchGANDiscriminator(
+            input_channels=128 + 64, aggregation=patch_aggregation
+        )
         self.frame_critic = FrameDiscriminator(input_channels=128 + 64)
 
         self.transforms = v2_transforms.Compose(
@@ -118,6 +184,29 @@ class TTTSWIGAN(LightningModule):
                 v2_transforms.RandomResizedCrop(input_map_dims, scale=(0.7, 1.0)),
             ]
         )
+
+        if patch_critic_loss not in ("wasserstein", "hinge"):
+            raise NotImplementedError(
+                f"Unknown patch critic loss: {patch_critic_loss}. "
+                f"Please provide one of 'wasserstein', 'hinge'."
+            )
+        if gradient_penalty_reduction not in ("sum", "mean"):
+            raise NotImplementedError(
+                f"Unknown gradient penalty reduction: {gradient_penalty_reduction}. "
+                f"Please provide one of 'sum', 'mean'."
+            )
+        if noise_weight_init not in NOISE_WEIGHT_INITS:
+            raise NotImplementedError(
+                f"Unknown noise weight init: {noise_weight_init}. "
+                f"Please provide one of {NOISE_WEIGHT_INITS}."
+            )
+
+        # Resolved before save_hyperparameters so the checkpoint records the weight each
+        # head actually ran with, not None.
+        if lambda_penalty_patch is None:
+            lambda_penalty_patch = lambda_penalty
+        if lambda_penalty_frame is None:
+            lambda_penalty_frame = lambda_penalty
 
         if isinstance(loss_fn, str):
             if loss_fn == "l1":
@@ -168,16 +257,28 @@ class TTTSWIGAN(LightningModule):
         base_output, _ = self.base_critic(interpolated)
         if critic_type == "patch":
             d_interpolated, _ = self.patch_critic(base_output)
+            lambda_penalty = self.hparams.lambda_penalty_patch
         elif critic_type == "frame":
             d_interpolated, _ = self.frame_critic(base_output)
+            lambda_penalty = self.hparams.lambda_penalty_frame
         else:
             raise RuntimeError(
                 f"Unknown critic type: {critic_type}. " f"Please provide one of 'patch', 'frame'"
             )
         d_interpolated = d_interpolated.requires_grad_(True)
-        # Use scalar output for autograd
+        # Reduce to a scalar for autograd. "sum" adds up the 20 patch outputs but only the
+        # single frame output, so it constrains the patch critic ~20x more tightly than the
+        # loss that consumes it -- which keeps the patch scores too small to ever reach a
+        # hinge margin. "mean" differentiates the same functional the loss uses, so
+        # lambda_penalty means the same thing for both heads. Under
+        # patch_aggregation="learned" the patch critic already emits one scalar, so the
+        # two branches agree and this setting only affects "mean" aggregation.
+        if self.hparams.gradient_penalty_reduction == "mean":
+            scalar_output = d_interpolated.flatten(1).mean(dim=1).sum()
+        else:
+            scalar_output = d_interpolated.sum()
         gradients = autograd.grad(
-            outputs=d_interpolated.sum(),
+            outputs=scalar_output,
             inputs=interpolated,
             create_graph=True,
             retain_graph=True,
@@ -185,9 +286,7 @@ class TTTSWIGAN(LightningModule):
         )[0]
 
         gradients = gradients.view(batch_size, -1)
-        gradient_penalty = (
-            self.hparams.lambda_penalty * ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
-        )
+        gradient_penalty = lambda_penalty * ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
         return gradient_penalty
 
     def compute_feature_loss(
@@ -327,9 +426,33 @@ class TTTSWIGAN(LightningModule):
         frame_critic_fake, _ = self.frame_critic(base_critic_fake)
 
         # Compute the losses for each discriminator and aggregate them
-        loss_critic_patch = torch.mean(patch_critic_fake) - torch.mean(patch_critic_real)
+        if self.hparams.patch_critic_loss == "hinge":
+            loss_critic_patch = (
+                F.relu(1.0 - patch_critic_real).mean() + F.relu(1.0 + patch_critic_fake).mean()
+            )
+        else:
+            loss_critic_patch = torch.mean(patch_critic_fake) - torch.mean(patch_critic_real)
         loss_critic_frame = torch.mean(frame_critic_fake) - torch.mean(frame_critic_real)
         total_loss_critic = loss_critic_patch + loss_critic_frame
+
+        # Scale-free separation of the patch grid, logged so the curve stays comparable
+        # across runs even though the hinge loss is on a different scale to Eq. 3.5.
+        patch_separation = torch.mean(patch_critic_real) - torch.mean(patch_critic_fake)
+        # Fraction of scores still inside +/-1. Under "hinge" this is the fraction still
+        # receiving gradient; under "wasserstein" it is a readout of the critic's output
+        # scale, which is what the gradient penalty is there to anchor.
+        patch_margin_active = 0.5 * (
+            (patch_critic_real < 1.0).float().mean() + (patch_critic_fake > -1.0).float().mean()
+        )
+
+        # Output scale, logged directly so a change in lambda_penalty or in the
+        # aggregation can be read off the curves instead of rescoring checkpoints.
+        patch_scores = torch.cat([patch_critic_real.flatten(), patch_critic_fake.flatten()])
+        frame_scores = torch.cat([frame_critic_real.flatten(), frame_critic_fake.flatten()])
+        patch_score_sd = patch_scores.std()
+        frame_score_sd = frame_scores.std()
+        patch_score_absmax = patch_scores.abs().max()
+        frame_score_absmax = frame_scores.abs().max()
 
         if self.training:
             # add gradient penalty
@@ -353,6 +476,12 @@ class TTTSWIGAN(LightningModule):
             "total_loss_critic": total_loss_critic,
             "loss_patch_critic": loss_critic_patch,
             "loss_frame_critic": loss_critic_frame,
+            "patch_separation": patch_separation,
+            "patch_margin_active": patch_margin_active,
+            "patch_score_sd": patch_score_sd,
+            "frame_score_sd": frame_score_sd,
+            "patch_score_absmax": patch_score_absmax,
+            "frame_score_absmax": frame_score_absmax,
             "gradient_penalty": gradient_penalty
             if self.training
             else torch.tensor(0.0, device=total_loss_critic.device),
@@ -379,11 +508,20 @@ class TTTSWIGAN(LightningModule):
         for _ in range(self.hparams.num_critic_iterations_per_epoch):
             opt_critic.zero_grad()
             critic_outputs = self.critic_step(batch, z)
-            (loss_critic, loss_patch_critic, loss_frame_critic, gradient_penalty) = (
+            (
+                loss_critic,
+                loss_patch_critic,
+                loss_frame_critic,
+                gradient_penalty,
+                patch_separation,
+                patch_margin_active,
+            ) = (
                 critic_outputs["total_loss_critic"],
                 critic_outputs["loss_patch_critic"],
                 critic_outputs["loss_frame_critic"],
                 critic_outputs["gradient_penalty"],
+                critic_outputs["patch_separation"],
+                critic_outputs["patch_margin_active"],
             )
             self.manual_backward(loss_critic)
             opt_critic.step()
@@ -407,6 +545,12 @@ class TTTSWIGAN(LightningModule):
                 "train/total_critic_loss": loss_critic,
                 "train/critic_patch_loss": loss_patch_critic,
                 "train/critic_frame_loss": loss_frame_critic,
+                "train/critic_patch_separation": patch_separation,
+                "train/critic_patch_margin_active": patch_margin_active,
+                "train/critic_patch_score_sd": critic_outputs["patch_score_sd"],
+                "train/critic_frame_score_sd": critic_outputs["frame_score_sd"],
+                "train/critic_patch_score_absmax": critic_outputs["patch_score_absmax"],
+                "train/critic_frame_score_absmax": critic_outputs["frame_score_absmax"],
                 "train/gradient_penalty": gradient_penalty,
                 "train/generator_loss": loss_generator,
                 "train/generator_pixel_distance_loss": pixel_distance_loss
@@ -437,10 +581,11 @@ class TTTSWIGAN(LightningModule):
         batch_size = batch["input_maps"].shape[0]
         z = torch.randn(batch_size, self.hparams.z_dim, device=batch["input_maps"].device)
         critic_outputs = self.critic_step(batch, z)
-        loss_critic, loss_patch_critic, loss_frame_critic = (
+        loss_critic, loss_patch_critic, loss_frame_critic, patch_separation = (
             critic_outputs["total_loss_critic"],
             critic_outputs["loss_patch_critic"],
             critic_outputs["loss_frame_critic"],
+            critic_outputs["patch_separation"],
         )
         generator_outputs = self.generator_step(batch, z)
         (loss_generator, pixel_distance_loss, smape, rmse, feature_loss) = (
@@ -457,6 +602,7 @@ class TTTSWIGAN(LightningModule):
                 "val/total_critic_loss": loss_critic,
                 "val/critic_patch_loss": loss_patch_critic,
                 "val/critic_frame_loss": loss_frame_critic,
+                "val/critic_patch_separation": patch_separation,
                 "val/generator_loss": loss_generator,
                 "val/generator_pixel_distance_loss": pixel_distance_loss
                 / self.hparams.image_distance_weight,
@@ -486,10 +632,11 @@ class TTTSWIGAN(LightningModule):
         batch_size = batch["input_maps"].shape[0]
         z = torch.randn(batch_size, self.hparams.z_dim, device=batch["input_maps"].device)
         critic_outputs = self.critic_step(batch, z)
-        loss_critic, loss_patch_critic, loss_frame_critic = (
+        loss_critic, loss_patch_critic, loss_frame_critic, patch_separation = (
             critic_outputs["total_loss_critic"],
             critic_outputs["loss_patch_critic"],
             critic_outputs["loss_frame_critic"],
+            critic_outputs["patch_separation"],
         )
         generator_outputs = self.generator_step(batch, z)
         (loss_generator, pixel_distance_loss, smape, rmse, feature_loss) = (
@@ -505,6 +652,7 @@ class TTTSWIGAN(LightningModule):
                 "test/total_critic_loss": loss_critic,
                 "test/critic_patch_loss": loss_patch_critic,
                 "test/critic_frame_loss": loss_frame_critic,
+                "test/critic_patch_separation": patch_separation,
                 "test/generator_loss": loss_generator,
                 "test/generator_pixel_distance_loss": pixel_distance_loss,
                 "test/feature_loss": feature_loss,
@@ -619,8 +767,23 @@ class TTTSWIGAN(LightningModule):
 
     def configure_optimizers(self) -> tuple[list[torch.optim.Optimizer], list[Any]]:
         """Configure the optimizers."""
+        # The noise gains get their own param group so their learning rate can be set
+        # independently of the convs'. At a shared rate they move ~1e-3 over a 120-epoch
+        # run, which is far below the O(0.1) they would need to reach to change the output
+        # -- so without this split the gains are fixed by their init rather than learned.
+        named_generator_params = list(self.generator.named_parameters())
+        noise_params = [p for name, p in named_generator_params if "noise_weights" in name]
+        conv_params = [p for name, p in named_generator_params if "noise_weights" not in name]
+        generator_param_groups: list[dict[str, Any]] = [{"params": conv_params}]
+        if noise_params:
+            generator_param_groups.append(
+                {
+                    "params": noise_params,
+                    "lr": self.hparams.lr * self.hparams.noise_weight_lr_scale,
+                }
+            )
         optimizer_generator = self.hparams.optim(
-            self.generator.parameters(),
+            generator_param_groups,
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
             betas=(0.5, 0.999),

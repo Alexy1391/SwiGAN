@@ -14,17 +14,12 @@ dataset:
     - "tasmaxAdjust"
     - "tasminAdjust"
   target_column: "swi_u"
+  map_dimensions: (37, 44)
   x_dim_column: null
   y_dim_column: null
   starting_year: 2022
   starting_month: 5
 
-model:
-  checkpoint_path: "swigan_batch_size_64/2026-08-17_08-13-44/checkpoints/last.ckpt"
-  train_dataset_statistics_path: "swigan_batch_size_64/2026-08-17_08-13-44/train_dataset_statistics.npz"
-  saving_path: "Outputs/inference_grand_est_test"
-  loss_fn: "l1"
-  num_trajectories: 20
-  num_trajectories_per_batch: 10
-  noise_std: 1.0
-  dtype: "float16"
+evaluation:
+  trajectories_path: "Outputs/inference_grand_est_test.npy"
+  saving_path: "Outputs/evaluation_metrics_grand_est_test"

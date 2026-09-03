@@ -1,7 +1,7 @@
 experiment_name: "swigan_batch_size_64"
 
 dataset:
-  filepath: "/home/didier/Downloads/data_train.parquet"
+  filepath: "data_train.parquet"
   fill_missing_pixels: true
   input_columns:
     - "evspsblpotAdjust-FAO"
@@ -23,6 +23,7 @@ dataset:
 train:
   seed: 60
   checkpoint_path: null
+  resume_ckpt_path: null
   train_ratio: 0.92
   val_ratio: 0.04
   batch_size: 64
@@ -34,20 +35,52 @@ train:
   timestamps_dim: 5
   spatial_dropout: 0.
   apply_center_block: true
-  start_lr: 5e-5
+  start_lr: 1e-5
   end_lr: 1e-7
-  weight_decay: 1e-1
+  weight_decay: 1e-4
   loss_fn: "l1"
   normalization: "batchnorm"
+  # Round 6: the hinge never crossed its margin and contributed nothing; the reduction
+  # fix was the whole effect. Wasserstein is the paper's Eq. 3.5.
+  patch_critic_loss: "wasserstein"
+  # "mean" is Eq. 3.5 applied in the loss, which collapses the 4x5 grid to a single
+  # linear readout because the final conv is 1x1 and the WGAN loss is linear.
+  # "learned" reduces the grid inside the critic through a non-linearity instead.
+  patch_aggregation: "mean"
+  gradient_penalty_reduction: "mean"
   num_critic_iterations_per_epoch: 5
-  lambda_penalty: 10.0
+  # lambda_pen = 10 per the paper, p.39. The per-head weights default to it when null;
+  # they are split because "sum"/"mean" reduction only ever changed the patch head.
+  lambda_penalty: 1.0
+  lambda_penalty_patch: null
+  lambda_penalty_frame: null
   image_distance_weight: 100.0
   feature_matching_weight: 10.0
+  # How the 20 per-channel noise gains are initialized. "randn" is what rounds 1-8 ran.
+  # "zeros" is StyleGAN's convention. Note this is more consequential than an init usually
+  # is: at start_lr 1e-5 -> end_lr 1e-7 nothing in this model travels more than ~1e-3 over
+  # 120 epochs, and a randn draw lands at rms 1.0, so the gains end the run 0.08% from where
+  # they started. The draw is effectively a fixed random hyperparameter, and "zeros" is
+  # effectively "train with injection off" rather than "let the model pick a noise scale".
+  # "randn3" is rms 3.0 -- round 12 only, to approach arm C's 1.489 asymptote from above.
+  noise_weight_init: "randn"
+  # Multiplier on the generator LR for the noise gains only. 1.0 is rounds 1-8. The shared
+  # rate is sized for Glorot convs at rms 0.017-0.16, which gives every parameter a ~1e-3
+  # travel budget; a gain that must reach O(0.1) to matter cannot get there on that budget,
+  # so at 1.0 the gains are fixed by their init rather than learned. 100 makes them movable.
+  noise_weight_lr_scale: 1.0
+  # Dropout for the LAST THREE downsampling blocks. Paper §8.2.1 (p.37) prescribes dropout in
+  # "the last three layers of the downsampling phase and the first three layers of the
+  # upsampling phase", citing Isola et al. [2018] on UNet generators that ignore the noise
+  # vector. Only the upsampling half was ever implemented -- unet_frame_decoder.py:176 hardcodes
+  # 0.3 on decoder blocks 0-2 -- while the encoder took `spatial_dropout`, which is 0. So rounds
+  # 1-10 ran half the prescription. 0.3 completes it; 0.0 reproduces those rounds exactly.
+  encoder_late_dropout: 0.0
   num_workers: 12
 
 logging:
-  save_checkpoint_every_n_epoch: 10
-  save_top_k_checkpoints: 10
+  save_checkpoint_every_n_epoch: 50
+  save_top_k_checkpoints: 20
   save_directory: null
   log_every_n_steps: 1
   log_figures_every_n_epochs: 20

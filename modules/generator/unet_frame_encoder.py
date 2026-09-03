@@ -10,7 +10,7 @@ from torchvision.ops import stochastic_depth
 from modules.base_conv_blocks import single_conv_block
 from modules.generator.center_block import CenterBlock
 from modules.scse import SCSEModule
-from modules.utils import glorot_init
+from modules.utils import glorot_init, init_noise_weights
 
 
 class UNetEncoderBlock(nn.Module):
@@ -26,6 +26,7 @@ class UNetEncoderBlock(nn.Module):
         dropout: float,
         normalization: str | None,
         prob: float = 1.0,
+        noise_weight_init: str = "randn",
     ) -> None:
         """Initialize the input parameters.
 
@@ -38,6 +39,8 @@ class UNetEncoderBlock(nn.Module):
                 If None, no normalization is applied. Supported normalization are
                 "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2D.
             prob: Survival probability for stochastic depth.
+            noise_weight_init: How to initialize the per-channel noise gains. See
+                ``modules.utils.init_noise_weights``.
 
         """
         super().__init__()
@@ -65,8 +68,8 @@ class UNetEncoderBlock(nn.Module):
             padding=1,
         )
         self.attention = SCSEModule(in_channels=out_channels)
-        self.noise_weights1 = nn.Parameter(torch.randn(out_channels))
-        self.noise_weights2 = nn.Parameter(torch.randn(out_channels))
+        self.noise_weights1 = init_noise_weights(out_channels, noise_weight_init)
+        self.noise_weights2 = init_noise_weights(out_channels, noise_weight_init)
         self.prob = prob
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -109,6 +112,8 @@ class UNetFrameEncoder(nn.Module):
         dropout: float,
         normalization: str | None = "batchnorm",
         apply_center_block: bool = False,
+        noise_weight_init: str = "randn",
+        encoder_late_dropout: float = 0.0,
     ) -> None:
         """Initialize the module.
 
@@ -121,6 +126,15 @@ class UNetFrameEncoder(nn.Module):
                 If None, no normalization is applied. Supported normalization are
                 "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2d.
             apply_center_block: Whether to apply the center block at the end of the encoding.
+            noise_weight_init: How to initialize the per-channel noise gains. See
+                ``modules.utils.init_noise_weights``.
+            encoder_late_dropout: Dropout rate for the *last three* downsampling blocks only.
+                ``article_recherche.pdf`` §8.2.1 puts dropout in "the last three layers of the
+                downsampling phase and the first three layers of the upsampling phase", citing
+                Isola et al. [2018] on UNet generators that ignore the noise vector. The
+                upsampling half is already hardcoded at ``unet_frame_decoder.py:176``; this is
+                the downsampling half, which rounds 1-10 ran without. 0.0 leaves the encoder
+                exactly as those rounds had it.
 
         """
         super().__init__()
@@ -128,14 +142,22 @@ class UNetFrameEncoder(nn.Module):
         layers = []
         downsample_layers = []
         self.probs = list(np.arange(1.0, 0.5, -0.5 / (len(out_channels) - 1))) + [0.5]
+        late_from = len(out_channels) - 3
         for idx, out in enumerate(out_channels):
+            # Only the last three blocks are affected, and only when the rate is set, so a
+            # non-zero ``dropout`` keeps applying everywhere exactly as it did before.
+            block_dropout = dropout
+            if encoder_late_dropout > 0.0 and idx >= late_from:
+                block_dropout = encoder_late_dropout
+
             layers.append(
                 UNetEncoderBlock(
                     in_channels=in_channel,
                     out_channels=out,
-                    dropout=dropout,
+                    dropout=block_dropout,
                     normalization=normalization,
                     prob=self.probs[idx],
+                    noise_weight_init=noise_weight_init,
                 )
             )
 
@@ -145,7 +167,7 @@ class UNetFrameEncoder(nn.Module):
                     out_channels=out,
                     kernel_size=2,
                     stride=2,
-                    dropout=dropout,
+                    dropout=block_dropout,
                     normalization=normalization,
                     padding=0,
                 )

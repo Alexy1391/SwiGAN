@@ -18,7 +18,11 @@ from torch.utils.data import DataLoader
 
 from swigan.engines.swigan_lit import TTTSWIGAN
 from utils.callbacks import RandomTimeStepMapCallback
-from utils.preprocessing import dataframe_to_rasters, fill_all_missing_pixels
+from utils.preprocessing import (
+    coerce_comma_decimal_columns,
+    dataframe_to_rasters,
+    fill_all_missing_pixels,
+)
 from utils.swi_dataset import build_train_val_test_datasets
 
 logger = logging.getLogger(__file__)
@@ -74,6 +78,8 @@ def main(cfg: DictConfig) -> None:
     ]
     columns_to_drop = [col for col in input_df.columns if col not in useful_columns]
     input_df = input_df.drop(columns=columns_to_drop)
+
+    input_df = coerce_comma_decimal_columns(input_df, [*feature_columns, target_column])
 
     # Extract features and targets
     map_height, map_width = ast.literal_eval(dataset_cfg["map_dimensions"])
@@ -136,12 +142,20 @@ def main(cfg: DictConfig) -> None:
             loss_fn=train_cfg["loss_fn"],
             optim=torch.optim.AdamW,
             normalization=train_cfg["normalization"],
+            patch_critic_loss=train_cfg["patch_critic_loss"],
+            patch_aggregation=train_cfg["patch_aggregation"],
+            gradient_penalty_reduction=train_cfg["gradient_penalty_reduction"],
             num_critic_iterations_per_epoch=train_cfg["num_critic_iterations_per_epoch"],
             lambda_penalty=train_cfg["lambda_penalty"],
+            lambda_penalty_patch=train_cfg["lambda_penalty_patch"],
+            lambda_penalty_frame=train_cfg["lambda_penalty_frame"],
             image_distance_weight=train_cfg["image_distance_weight"],
             feature_matching_weight=train_cfg["feature_matching_weight"],
             max_epochs=train_cfg["num_epochs"],
             min_lr=train_cfg["end_lr"],
+            noise_weight_init=train_cfg["noise_weight_init"],
+            noise_weight_lr_scale=train_cfg["noise_weight_lr_scale"],
+            encoder_late_dropout=train_cfg["encoder_late_dropout"],
         )
         # Save the input_statistics
         model.input_statistics = statistics
@@ -191,9 +205,10 @@ def main(cfg: DictConfig) -> None:
         logger=tb_logger,
     )
 
+    resume_ckpt_path = train_cfg.get("resume_ckpt_path")
     logger.info(f"Starting training for {train_cfg['num_epochs']} epochs...")
     start_time = datetime.datetime.now()
-    trainer.fit(model, train, val)
+    trainer.fit(model, train, val, ckpt_path=resume_ckpt_path)
     logger.info(f"Training finished in {datetime.datetime.now() - start_time}s..")
 
     logger.info("Testing model...")

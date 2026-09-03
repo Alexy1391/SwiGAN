@@ -205,3 +205,27 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Files that are not necessary to run the code 
+
+Outputs/
+outputs/
+Grand Est/
+pricing/dep_08/
+pricing/outputs/
+swigan_batch_size_64/
+swigan_france_multiregion/
+article_recherche.pdf
+lightning_logs/
+checkpoints/
+*.ckpt
+*.parquet
+events.out.tfevents.*
+*.md
+*.txt
+*.tex
+*.json
+*.xlsx
+*.sh
+swigan_round*
+swigan_paper*
