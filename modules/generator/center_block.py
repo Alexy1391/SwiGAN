@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from torch import nn
-
-from modules.base_conv_blocks import single_conv_block
+from modules.base_conv_blocks import MaskedSequential, single_conv_block
 
 
-class CenterBlock(nn.Sequential):
-    """Center convolutional block to apply at the end of the unet downsampling stage."""
+class CenterBlock(MaskedSequential):
+    """Center convolutional block to apply at the end of the unet downsampling stage.
+
+    A :class:`~modules.base_conv_blocks.MaskedSequential`, so ``block(x, mask)`` normalizes
+    over the region's cells and ``block(x)`` is the plain two-convolution stack.
+    """
 
     def __init__(
         self,
@@ -26,7 +28,8 @@ class CenterBlock(nn.Sequential):
             dropout: Dropout rate.
             normalization: normalization: The type of normalization to apply.
                 If None, no normalization is applied. Supported normalization are
-                "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2D.
+                "batchnorm", "instancenorm" or "groupnorm"; see
+                :func:`modules.base_conv_blocks.single_conv_block`.
 
         """
         conv1 = single_conv_block(

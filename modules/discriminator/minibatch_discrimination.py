@@ -1,5 +1,7 @@
 """Module containing a minibatch discrimination module."""
 
+from __future__ import annotations
+
 import torch
 from torch import nn
 
@@ -26,12 +28,24 @@ class MiniBatchDiscrimination(nn.Module):
 
         self.T = nn.Parameter(torch.randn(in_features, out_features, kernel_dims) * 0.05)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass.
+
+        The similarity statistic is spatial: at every cell, each sample's projected
+        feature is compared to the other samples' at the same cell. In a padding cell every
+        sample carries the same constant, so the statistic is ``batch_size - 1`` there
+        regardless of the data; ``mask`` zeroes those cells so the padding geometry is not
+        handed to the heads as a feature. Within a single-region batch the mask is the same
+        for every sample, which is what keeps the comparison between like and like.
 
         Args:
         ----
             x: Input tensor of shape (batch_size, channels, H, W).
+            mask: Binary mask of shape (batch_size, 1, H, W), or None.
+
+        Returns:
+        -------
+            ``x`` with ``out_features`` similarity channels appended.
 
         """
         batch_size = x.size(0)
@@ -50,10 +64,13 @@ class MiniBatchDiscrimination(nn.Module):
 
         exp_neg_diff = torch.exp(-diff)
 
-        mask = 1 - torch.eye(batch_size, device=x.device)
+        others = 1 - torch.eye(batch_size, device=x.device)
         out = (
-            (exp_neg_diff * mask[..., None, None, None]).sum(1).contiguous()
+            (exp_neg_diff * others[..., None, None, None]).sum(1).contiguous()
         )  # [batch, w, h, out_features]
+        out = out.transpose(3, 1)  # [batch, out_features, h, w]
+        if mask is not None:
+            out = out * mask.to(out.dtype)
 
         # Concatenate with original features
-        return torch.cat([x, out.transpose(3, 1)], dim=1)
+        return torch.cat([x, out], dim=1)

@@ -32,6 +32,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
+from modules.masking import mask_pyramid
 from swigan.engines.swigan_lit import TTTSWIGAN
 from utils.preprocessing import (
     coerce_comma_decimal_columns,
@@ -124,17 +125,24 @@ def _score_split(
             mask=batch["mask"],
             noise_vector=z,
         )
+        _, mask = model.to_critic_canvas(batch["target_maps"], batch["mask"])
+        weight = mask_pyramid(mask, len(model.base_critic.blocks))[-1]
+        # Every sample of a split shares the region mask, so the set of tiles with data
+        # under them is one fixed subset of the grid; the padding tiles are dropped here
+        # so the per-cell metrics are over the cells the loss actually consumes.
+        valid_tiles = (weight[0, 0] > 0).flatten()
         for kind, maps in (("real", batch["target_maps"]), ("fake", fake)):
-            base, _ = model.base_critic(maps)
-            patch, _ = model.patch_critic(base)
-            frame, _ = model.frame_critic(base)
-            tiles = model.patch_critic.tile_scores(base)
-            # Under "mean" aggregation the loss consumes the grid average; under
-            # "learned" the head already returns the scalar. Reduce to one score per
-            # sample either way so the two are comparable.
-            out[f"patch_{kind}"].append(patch.flatten(1).mean(dim=1).cpu())
+            maps, _ = model.to_critic_canvas(maps, batch["mask"])
+            base, _ = model.base_critic(maps, mask)
+            patch, _ = model.patch_critic(base, weight=weight)
+            frame, _ = model.frame_critic(base, weight=weight)
+            tiles = model.patch_critic.tile_scores(base, weight=weight)
+            # Under "mean" aggregation the loss consumes the coverage-weighted grid
+            # average; under "learned" the head already returns the scalar. Reduce to
+            # one score per sample either way so the two are comparable.
+            out[f"patch_{kind}"].append(model.patch_scalar(patch, weight).cpu())
             out[f"frame_{kind}"].append(frame.flatten(1).mean(dim=1).cpu())
-            out[f"tiles_{kind}"].append(tiles.flatten(1).cpu())
+            out[f"tiles_{kind}"].append(tiles.flatten(1)[:, valid_tiles].cpu())
     return {key: torch.cat(value).numpy() for key, value in out.items()}
 
 

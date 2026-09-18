@@ -1,22 +1,36 @@
-experiment_name: "swigan_batch_size_64"
+experiment_name: "swigan_corse_batch_size_64_1000"
 
 dataset:
-  filepath: "data_train.parquet"
+  filepath: "Outputs/rcp_8.5/Corse/data_train.parquet"
+  # Chronological splits shipped as separate files: train 1960-2021, val 2022-2023,
+  # test 2024-2025. Set both to null to fall back to splitting `filepath` with
+  # train_ratio/val_ratio below, which is what the legacy "Grand Est/" layout needs.
+  val_filepath: "Outputs/rcp_8.5/Corse/data_val.parquet"
+  test_filepath: "Outputs/rcp_8.5/Corse/data_test.parquet"
+  # The splits are contiguous, so seed val/test with the last `input_steps` months of the
+  # preceding split as SWI history. Those months are only ever fed as context and are never
+  # scored, so the 24-month val and test splits yield 24 samples instead of 16.
+  carry_context_across_splits: true
   fill_missing_pixels: true
   input_columns:
-    - "evspsblpotAdjust-FAO"
-    - "evspsblpotAdjust-Hg0175"
+    - "evspsblpotAdjust"
     - "hussAdjust"
     - "prtotAdjust_max"
     - "prtotAdjust_sum"
     - "prtotAdjust_avg"
     - "rldsAdjust"
     - "rsdsAdjust"
+    - "sfcWindAdjust"
     - "tasAdjust"
     - "tasmaxAdjust"
     - "tasminAdjust"
   target_column: "swi_u"
-  map_dimensions: (37, 44)
+  # (height, width) of the region's 8 km grid. Every rcp_8.5 region sits on the same
+  # projection, only the extent differs: Corse is 23 x 11 (253 cells, 140 inside the
+  # region), Grand Est 36 x 44 (1584 cells, 894 inside). A wrong size silently drops every
+  # month. The generator pads any grid up to 48x48 internally; the critics are fully
+  # convolutional and derive their tile grid from this size.
+  map_dimensions: (23, 11)
   x_dim_column: null
   y_dim_column: null
 
@@ -24,11 +38,12 @@ train:
   seed: 60
   checkpoint_path: null
   resume_ckpt_path: null
+  # Only used when dataset.val_filepath / dataset.test_filepath are null.
   train_ratio: 0.92
   val_ratio: 0.04
   batch_size: 64
   input_steps: 8
-  num_epochs: 1500
+  num_epochs: 250
   noise_dim: 32
   encoder_channels: [64, 128, 256, 256, 256]
   decoder_channels: [256, 256, 256, 128, 64]
@@ -38,15 +53,42 @@ train:
   start_lr: 1e-5
   end_lr: 1e-7
   weight_decay: 1e-4
+  # Pixel term. "l1" / "mse" score the one sample the critics see. "crps" / "energy" are
+  # proper scores over a mini-ensemble of `ensemble_size` samples per input (fair CRPS per cell,
+  # energy score per map) and are the only terms that credit spread; the L1 term is what trained
+  # the dispersion away. See TTTSWIGAN.ensemble_pixel_distance. Both need ensemble_size >= 2.
   loss_fn: "l1"
+  # Generator samples per input; the K run as one generator batch of K x batch_size (the memory
+  # knob) and the epoch costs about 2x at K = 4 with the critic iterations unchanged.
+  ensemble_size: 1
+  # Share of TRAINING samples whose eight SWI history frames are scaled by one factor drawn from
+  # history_dropout_range, so the model learns to weigh the covariates when the state is
+  # uncertain instead of letting a dry history veto a wet month. 0.0 is every round so far.
+  history_dropout_prob: 0.0
+  history_dropout_range: [0.0, 1.0]
+  # Generator normalization. "batchnorm" is what every round so far trained on; its
+  # statistics pool over the batch, so at the 1x1 bottleneck it still has one value per
+  # sample to work with.
+  #
+  # "instancenorm" and "groupnorm" are per-sample instead, which drops the last coupling
+  # between a Corse map and whatever it happens to be batched with. Both reduce over space,
+  # and space runs out: the five stride-2 downsamples take 48 -> 24 -> 12 -> 6 -> 3 -> 1, and
+  # InstanceNorm on a 1x1 map has one number, a variance of 0, and normalizes every
+  # activation to exactly 0 -- plain nn.InstanceNorm2d refuses outright. So "instancenorm"
+  # now means InstanceNorm down to modules.masking.INSTANCE_NORM_MIN_DIM (17) and masked
+  # GroupNorm below it: the 48 and 24 levels take the instance branch, 12 down to 1 the group
+  # branch, so 9 of the 27 norms are instance and 18 group. 17 is set from the sigma estimate
+  # itself -- at 12x12 a 140-cell region has 15 valid cells left and InstanceNorm's divisor
+  # carries 20% relative error there, against 4% for the group form -- and from the noise
+  # injection, which happens after the norm and so only has a fixed signal-to-noise ratio on
+  # the instance branch. "groupnorm" is the group form throughout.
+  # Neither has been trained yet; expect a different loss trajectory, not a drop-in swap.
   normalization: "batchnorm"
-  # Round 6: the hinge never crossed its margin and contributed nothing; the reduction
-  # fix was the whole effect. Wasserstein is the paper's Eq. 3.5.
   patch_critic_loss: "wasserstein"
   # "mean" is Eq. 3.5 applied in the loss, which collapses the 4x5 grid to a single
   # linear readout because the final conv is 1x1 and the WGAN loss is linear.
   # "learned" reduces the grid inside the critic through a non-linearity instead.
-  patch_aggregation: "mean"
+  patch_aggregation: "learned"
   gradient_penalty_reduction: "mean"
   num_critic_iterations_per_epoch: 5
   # lambda_pen = 10 per the paper, p.39. The per-head weights default to it when null;
@@ -54,8 +96,8 @@ train:
   lambda_penalty: 1.0
   lambda_penalty_patch: null
   lambda_penalty_frame: null
-  image_distance_weight: 100.0
-  feature_matching_weight: 10.0
+  image_distance_weight: 12.0
+  feature_matching_weight: 1.2
   # How the 20 per-channel noise gains are initialized. "randn" is what rounds 1-8 ran.
   # "zeros" is StyleGAN's convention. Note this is more consequential than an init usually
   # is: at start_lr 1e-5 -> end_lr 1e-7 nothing in this model travels more than ~1e-3 over
@@ -69,6 +111,19 @@ train:
   # travel budget; a gain that must reach O(0.1) to matter cannot get there on that budget,
   # so at 1.0 the gains are fixed by their init rather than learned. 100 makes them movable.
   noise_weight_lr_scale: 1.0
+  # The spatially COHERENT noise channel: null leaves it out of the model entirely (the state
+  # dict is then the one every checkpoint up to the 250-epoch arm holds), "zeros" adds it
+  # switched off so a fine-tune starts bit-identical in distribution and has to earn its
+  # width, "randn" starts it at rms 1.0 for training from scratch.
+  # WHY. The existing gains scale a field drawn per pixel, which the region mean averages
+  # away: measured on the 250-epoch arm the ensemble's region/pixel spread ratio is 0.13-0.25
+  # against the truth's 0.63-0.90, and reaching November's required 0.263 SWI of region-mean
+  # spread through speckle would take ~1.3 SWI per pixel on a 0-1 field. That is why fifty
+  # epochs of an energy score walked these gains at random: no reachable direction existed.
+  # The coherent draw is constant over height and width, so it passes through spatial
+  # averaging undiminished and gives a proper score something it can actually optimise.
+  # Pair it with noise_weight_lr_scale 100 -- it shares that param group -- or it cannot move.
+  coherent_noise_init: null
   # Dropout for the LAST THREE downsampling blocks. Paper §8.2.1 (p.37) prescribes dropout in
   # "the last three layers of the downsampling phase and the first three layers of the
   # upsampling phase", citing Isola et al. [2018] on UNet generators that ignore the noise
@@ -76,11 +131,92 @@ train:
   # 0.3 on decoder blocks 0-2 -- while the encoder took `spatial_dropout`, which is 0. So rounds
   # 1-10 ran half the prescription. 0.3 completes it; 0.0 reproduces those rounds exactly.
   encoder_late_dropout: 0.0
+  # Mask-aware critic path. Every reduction over space in the critics -- InstanceNorm
+  # statistics, the patch critic's tile mean, MiniBatch Discrimination, the gradient
+  # penalty norm, the pixel and feature-matching losses -- is weighted by the region mask,
+  # so the 45% of padding on Grand Est and Corse (or the 96% once a region sits on a
+  # common canvas) never enters the critic's statistics. The two switches below are the
+  # only optional parts of that path.
+  # Feed the region mask to the critic trunk as an extra input channel. Real and fake share
+  # it per sample, so it carries no label; it tells padding apart from a cell whose
+  # standardized value happens to be 0.
+  critic_mask_channel: true
+  # "instancenorm" is the masked InstanceNorm2d; null drops normalization from the critic
+  # (spectral norm stays), which is the WGAN-GP authors' recommendation and an ablation
+  # worth running: it removes the padding-fraction dependence entirely.
+  critic_normalization: "instancenorm"
+  # Feed the region mask to the generator as an extra input channel. Without it the coast is
+  # only visible as "every channel is exactly 0", and 0 is the standardized mean.
+  generator_mask_channel: true
+  # Take the generator's normalization statistics over the region's cells too: its 37
+  # BatchNorms, the global average pool inside its 10 scSE channel gates, and a re-zeroing of
+  # every block's padding. Off, BatchNorm averages the whole 48x48 canvas -- 94% padding on
+  # Corse -- and a variance diluted by the coverage makes the region's normalized activations
+  # 1/sqrt(c) times too LARGE: 3.8x at the first encoder block here, a median 1.1x over the
+  # 24 spatial norms as the deeper padding fills with its own bias plateau. The three parts
+  # only work together: zeros are still cells BatchNorm counts, so re-zeroing alone changes
+  # no statistic, and a masked norm alone leaves an out-of-range constant on the padding that
+  # the next 3x3 conv bleeds back across the coast. The prize is not that factor, which gamma
+  # and the next conv can absorb over 1500 epochs, but its dependence on coverage: without
+  # this, a batch mixing Grand Est (38.9%) with Corse (6.1%) normalizes the same map
+  # differently depending on who it is batched with, so the per-region sampler and Grand Est
+  # to Corse transfer are blocked on it. false reproduces rounds 1-12. Note it asserts that
+  # outside the mask there is nothing -- true of the sea, and of any mask meaning "the cells
+  # this run has data for"; not of a Grand Est mask whose outside is French land in another
+  # file.
+  generator_masked_norm: true
+  # Score the critics on the 48x48 canvas the generator pads to, region at the same offset,
+  # instead of on the native grid. Not the same computation: on the native grid every window
+  # that hangs off the grid's edge is dropped at every level, so Corse's 23x11 reaches the
+  # heads as 6 trunk cells and 2 tiles; on the canvas the same island is under 11 trunk
+  # cells and 19 tiles. Padding tiles never enter the loss either way. false is the native
+  # grid, which for the 36x44 Grand Est grid (5x6 trunk, 4x5 tiles) is what every earlier
+  # round scored on. DiffAugment's translation and cutout scale with the map, so on the
+  # canvas they are 20% / 30% of 48 rather than of the region -- unless the switch below
+  # takes them off the map and onto the region.
+  critic_on_padded_canvas: true
+  # Size and place DiffAugment's translation and cutout on the region's bounding box rather
+  # than on the map the critics are handed. On a native grid the two are the same thing, so
+  # this only bites together with `critic_on_padded_canvas`: there the stock policy shifts
+  # by 20% of 48 and cuts a 14x14 box, and against Corse's 23x11 island that box removes
+  # more than half of it on 6.2% of draws (81% at worst), where the native grid's own 7x3
+  # box could never take more than 15%. On the region the box is 7x3 again and its centre is
+  # drawn over the island rather than over the canvas, which puts both the size and the hit
+  # rate back where every Grand Est round had them. false is the stock policy and reproduces
+  # rounds 1-12 exactly.
+  diff_augment_on_region: true
   num_workers: 12
 
+# Free-running rollout of the val split, scored at the end of every validation epoch and of
+# `trainer.test`. val/generator_rmse is teacher-forced -- one month ahead of eight OBSERVED SWI
+# frames -- so it never sees error compound; this rolls the generator over the whole split on
+# its own predictions, which is the protocol of the paper's Section 5.1 and of
+# run_paper1500_metrics.sh. The val and test splits are 24 months each under the chronological
+# layout above, so `val/rollout_rmse` is a 24-step rollout RMSE over Jan 2022 - Dec 2023.
+# Cost is `num_steps` sequential forward passes of one `num_members`-sized batch per epoch --
+# about two training batches' worth, whatever the grid, since the generator pads to 48x48.
+rollout:
+  enabled: true
+  # Members run as a single batch, so the horizon costs the same at 1 as at 8. The paper's
+  # offline scorer uses 20; 8 is enough to average the per-pixel maps without widening the epoch.
+  num_members: 8
+  noise_std: 1.0
+  # Held fixed across epochs so a move in the curve is a move in the model, not a new draw.
+  seed: 0
+  # Keep at 1 while `checkpoint_monitor` is a rollout metric: ModelCheckpoint has nothing to
+  # read on a skipped epoch.
+  every_n_epochs: 1
+  # null = the whole split (24 months for val and test here).
+  num_steps: null
+
 logging:
-  save_checkpoint_every_n_epoch: 50
-  save_top_k_checkpoints: 20
+  # What ModelCheckpoint ranks `save_top_k` on. "val/rollout_rmse" selects on the free-running
+  # error, which is the quantity the paper reports and the one that stops improving first;
+  # "val/generator_rmse_epoch" is the teacher-forced metric rounds 1-12 selected on, and is what
+  # to set this back to when `rollout.enabled` is false.
+  checkpoint_monitor: "val/rollout_rmse"
+  save_checkpoint_every_n_epoch: 5
+  save_top_k_checkpoints: 40
   save_directory: null
   log_every_n_steps: 1
   log_figures_every_n_epochs: 20

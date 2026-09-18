@@ -66,6 +66,7 @@ from torch.utils.data import DataLoader
 from modules.discriminator.base_discriminator import BaseDiscriminator
 from modules.discriminator.frame_discriminator import FrameDiscriminator
 from modules.discriminator.patch_gan_discriminator import PatchGANDiscriminator
+from modules.masking import mask_pyramid
 from swigan.engines.swigan_lit import TTTSWIGAN
 from utils.critic_diagnostics import auc
 from utils.preprocessing import (
@@ -173,33 +174,63 @@ def _build_probe(model: TTTSWIGAN, aggregation: str, device: torch.device) -> nn
     patch head's aggregation is pinned rather than copied, so the instrument does not
     change between the runs being compared.
     """
+    # The "learned" aggregator's readout is sized to the tile grid, which depends on the
+    # grid the run's critic scored on: the native grid or the padded canvas.
+    critic_dims = TTTSWIGAN.critic_map_dims(
+        list(model.hparams.input_map_dims),
+        bool(model.hparams.get("critic_on_padded_canvas", False)),
+    )
+    tile_grid = mask_pyramid(torch.ones(1, 1, *critic_dims))[-1]
+    grid_shape = (int(tile_grid.shape[-2]), int(tile_grid.shape[-1]))
     probe = nn.ModuleDict(
         {
             "base": BaseDiscriminator(
                 input_channels=model.hparams.output_channels,
                 output_channels=[32, 64, 128],
                 mbd_output_channels=64,
+                mask_channel=model.hparams.get("critic_mask_channel", False),
+                normalization=model.hparams.get("critic_normalization", "instancenorm"),
             ),
-            "patch": PatchGANDiscriminator(input_channels=128 + 64, aggregation=aggregation),
-            "frame": FrameDiscriminator(input_channels=128 + 64),
+            "patch": PatchGANDiscriminator(
+                input_channels=128 + 64,
+                aggregation=aggregation,
+                grid_shape=grid_shape,
+                normalization=model.hparams.get("critic_normalization", "instancenorm"),
+            ),
+            "frame": FrameDiscriminator(
+                input_channels=128 + 64,
+                normalization=model.hparams.get("critic_normalization", "instancenorm"),
+            ),
         }
     )
     return probe.to(device)
 
 
-def _head_logits(probe: nn.ModuleDict, maps: torch.Tensor) -> dict[str, torch.Tensor]:
-    """One logit per sample per head. Under "mean" aggregation the grid is averaged."""
-    base, _ = probe["base"](maps)
-    patch, _ = probe["patch"](base)
-    frame, _ = probe["frame"](base)
+def _head_logits(
+    probe: nn.ModuleDict, maps: torch.Tensor, mask: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """One logit per sample per head, scored under the region mask.
+
+    Under "mean" aggregation the grid is averaged with the coverage weights, as the GAN's
+    loss does. ``mask`` is one (1, 1, H, W) map shared by every sample: the probe never
+    augments, so the region sits at the same place in every map.
+    """
+    levels = mask_pyramid(mask, len(probe["base"].blocks))
+    base, _ = probe["base"](maps, mask)
+    patch, _ = probe["patch"](base, weight=levels[-1])
+    frame, _ = probe["frame"](base, weight=levels[-1])
     return {
-        "patch": patch.flatten(1).mean(dim=1),
+        "patch": TTTSWIGAN.patch_scalar(patch, levels[-1]),
         "frame": frame.flatten(1).mean(dim=1),
     }
 
 
 def _batch_logits(
-    probe: nn.ModuleDict, real: torch.Tensor, fake: torch.Tensor, batching: str
+    probe: nn.ModuleDict,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    mask: torch.Tensor,
+    batching: str,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """Score one batch of real and one of generated maps, as (real, fake) per head.
 
@@ -208,10 +239,10 @@ def _batch_logits(
     critic step does.
     """
     if batching == "mixed":
-        logits = _head_logits(probe, torch.cat([real, fake]))
+        logits = _head_logits(probe, torch.cat([real, fake]), mask)
         return {head: (logits[head][: len(real)], logits[head][len(real) :]) for head in HEADS}
-    logits_real = _head_logits(probe, real)
-    logits_fake = _head_logits(probe, fake)
+    logits_real = _head_logits(probe, real, mask)
+    logits_fake = _head_logits(probe, fake, mask)
     return {head: (logits_real[head], logits_fake[head]) for head in HEADS}
 
 
@@ -220,6 +251,7 @@ def _score_set(
     probe: nn.ModuleDict,
     real: torch.Tensor,
     fake: torch.Tensor,
+    mask: torch.Tensor,
     batching: str,
     batch_size: int,
 ) -> dict[str, float]:
@@ -232,7 +264,7 @@ def _score_set(
     }
     for start in range(0, len(real), batch_size):
         stop = start + batch_size
-        scores = _batch_logits(probe, real[start:stop], fake[start:stop], batching)
+        scores = _batch_logits(probe, real[start:stop], fake[start:stop], mask, batching)
         for head, (real_scores, fake_scores) in scores.items():
             collected[f"{head}_real"].append(real_scores.cpu().numpy())
             collected[f"{head}_fake"].append(fake_scores.cpu().numpy())
@@ -298,6 +330,14 @@ def probe_generator(
     model.requires_grad_(False)
 
     data = {name: _materialise(splits[name], device) for name in ("train", "val", "test")}
+    # One region per dataset, so one mask serves every sample of every split. The probe
+    # scores where the run's critic scored: the native grid or the padded canvas.
+    mask_native = data["train"]["mask"][:1]
+
+    def on_canvas(maps: torch.Tensor) -> torch.Tensor:
+        return model.to_critic_canvas(maps, mask_native)[0]
+
+    mask = model.to_critic_canvas(mask_native, mask_native)[1]
     count = len(data["train"]["target_maps"])
     order = np.random.default_rng(PROBE_SPLIT_SEED).permutation(count)
     cut = int(PROBE_TRAIN_FRACTION * count)
@@ -307,9 +347,12 @@ def probe_generator(
     # Evaluation fakes are generated once per draw, before the probe is seeded, so the
     # probe's own RNG stream is unaffected by how many draws are asked for.
     eval_sets: dict[str, dict[str, Any]] = {
-        "heldout_train": {"real": data["train"]["target_maps"][held_index], "fakes": []},
+        "heldout_train": {
+            "real": on_canvas(data["train"]["target_maps"][held_index]),
+            "fakes": [],
+        },
         "gan_heldout": {
-            "real": torch.cat([data["val"]["target_maps"], data["test"]["target_maps"]]),
+            "real": on_canvas(torch.cat([data["val"]["target_maps"], data["test"]["target_maps"]])),
             "fakes": [],
         },
     }
@@ -318,17 +361,21 @@ def probe_generator(
         torch.manual_seed(seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
-        eval_sets["heldout_train"]["fakes"].append(_generate(model, data["train"], held_index))
+        eval_sets["heldout_train"]["fakes"].append(
+            on_canvas(_generate(model, data["train"], held_index))
+        )
         eval_sets["gan_heldout"]["fakes"].append(
-            torch.cat(
-                [
-                    _generate(
-                        model,
-                        data[name],
-                        torch.arange(len(data[name]["target_maps"]), device=device),
-                    )
-                    for name in ("val", "test")
-                ]
+            on_canvas(
+                torch.cat(
+                    [
+                        _generate(
+                            model,
+                            data[name],
+                            torch.arange(len(data[name]["target_maps"]), device=device),
+                        )
+                        for name in ("val", "test")
+                    ]
+                )
             )
         )
 
@@ -345,7 +392,7 @@ def probe_generator(
         point: dict[str, Any] = {"step": step}
         for name, contents in eval_sets.items():
             per_draw = [
-                _score_set(probe, contents["real"], fake, batching, batch_size)
+                _score_set(probe, contents["real"], fake, mask, batching, batch_size)
                 for fake in contents["fakes"]
             ]
             point[name] = {
@@ -364,10 +411,10 @@ def probe_generator(
     losses: list[float] = []
     for step in range(1, steps + 1):
         picks = fit_index[torch.randperm(len(fit_index), generator=sampler)[:batch_size].to(device)]
-        real = data["train"]["target_maps"][picks]
-        fake = _generate(model, data["train"], picks).detach()
+        real = on_canvas(data["train"]["target_maps"][picks])
+        fake = on_canvas(_generate(model, data["train"], picks)).detach()
 
-        scores = _batch_logits(probe, real, fake, batching)
+        scores = _batch_logits(probe, real, fake, mask, batching)
         loss = sum(
             F.binary_cross_entropy_with_logits(real_scores, torch.ones_like(real_scores))
             + F.binary_cross_entropy_with_logits(fake_scores, torch.zeros_like(fake_scores))

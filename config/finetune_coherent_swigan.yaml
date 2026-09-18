@@ -1,0 +1,68 @@
+# Energy-score fine-tune of the 250-epoch Corse checkpoint WITH the spatially coherent noise
+# channel switched on.
+#   python -m swigan.train --config-name finetune_coherent_swigan
+#
+# WHY THIS RUN EXISTS. Two energy-score fine-tunes have now failed, and the second one failed
+# informatively. With `noise_weight_lr_scale: 100` the per-channel gains travelled 25x further
+# than at scale 1 (0.616% against 0.025% of their own rms) and the ensemble came out NARROWER,
+# because the travel fits a power law in epochs with an exponent of 0.45 -- a random walk, not
+# a descent. The gains had no direction to move in, and the acceptance tables say why: the
+# field those gains scale is drawn per pixel, so the region mean averages it away. The shipped
+# ensemble's region/pixel spread ratio is 0.13-0.25 while the error it must span sits at
+# 0.63-0.90, and reaching November's required 0.263 SWI of region-mean spread through speckle
+# would take about 1.3 SWI per pixel on a field whose range is roughly 0 to 1. No setting of
+# those gains produces a calibrated region mean, so a proper score had no reachable optimum.
+#
+# `coherent_noise_init: zeros` adds the missing mode: a draw that is constant over height and
+# width, which survives spatial averaging. Measured on these very weights, before any
+# training, driving the new gains to 0.2 moves the region/pixel ratio from 0.224 to 0.771 and
+# multiplies region-mean spread by 7x -- which is the factor the acceptance test was short by.
+# The gains start at zero, so epoch 0 is the loaded checkpoint unchanged and every bit of
+# width the run ends with is width the energy score chose to buy.
+#
+# WHAT WOULD MAKE THIS A RESULT. Not val CRPS, which has a scatter of 0.056 between neighbouring
+# epochs. The test is `utils/spread_shape.py`, logged every epoch as val/rollout_spread_shape_*:
+# every calendar month's spread / required inside 0.8-1.25, at region level. The shipped
+# ensemble is 0/12 at 0.07-0.24; the previous fine-tune was 0/12 at 0.09-0.41. And the gains
+# must MOVE: if `noise_weight_lr_scale` 100 again produces a random walk -- travel growing as
+# the square root of the epochs and flattening when the schedule expires -- then the coherent
+# channel is not being used either, and the answer is not another learning rate.
+defaults:
+  - train_swigan
+  - _self_
+
+experiment_name: "swigan_corse_coherent_finetune"
+
+train:
+  checkpoint_path: "swigan_corse_batch_size_64_1000/2026-09-14_09-03-17/checkpoints/last.ckpt"
+  num_epochs: 50
+  batch_size: 64
+  ensemble_size: 4
+  loss_fn: "energy"
+  # The channel this run exists to test. The checkpoint predates it, so `swigan/train.py`
+  # loads with strict=False and logs that the 20 new gains -- and nothing else -- are fresh.
+  # NOT "zeros". The first attempt at this run started there and the gains went 0.0023 ->
+  # 0.0032 rms over 11 epochs, a growth exponent of 0.435 -- a random walk, extrapolating to
+  # 0.006 by epoch 50 against the ~0.1 that does anything. Zero is a plateau for this channel:
+  # a coherent perturbation of amplitude zero is independent of the spread the members already
+  # have, so its first-order contribution to the score averages out and the benefit is second
+  # order. 0.1 starts the run where the gradient is real; on these weights it puts the
+  # region/pixel ratio at 0.61 against the 0.63-0.90 of the error being spanned, mid-range so
+  # the score can move it either way.
+  coherent_noise_init: 0.1
+  # Both noise families share this group. At 1.0 neither can travel; this is not optional.
+  noise_weight_lr_scale: 100
+  # Low enough that the convolutions barely move, so what changes is the noise path rather
+  # than the mean. The previous run showed the restart itself is not what costs the mean --
+  # epoch 0 landed at 0.4322 against 0.4372 at a rate 3.3x higher, because the damage is
+  # BatchNorm buffers re-estimating on a K=4 batch, not the weights moving.
+  start_lr: 3e-6
+  end_lr: 1e-7
+  history_dropout_prob: 0.0
+  history_dropout_range: [0.0, 1.0]
+
+logging:
+  checkpoint_monitor: "val/rollout_crps"
+  save_checkpoint_every_n_epoch: 5
+  # The volume this repo lives on is 50 GB and each checkpoint is 195 MB. Ten is the budget.
+  save_top_k_checkpoints: 10

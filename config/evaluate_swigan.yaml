@@ -1,25 +1,27 @@
 dataset:
-  filepath: "Grand Est/data_train.parquet"
+  # Same file and same starting date as the inference run that produced the trajectories.
+  filepath: "Outputs/rcp_8.5/Grand Est/Grand_Est_2022_2025.parquet"
   fill_missing_pixels: true
   input_columns:
-    - "evspsblpotAdjust-FAO"
-    - "evspsblpotAdjust-Hg0175"
+    - "evspsblpotAdjust"
     - "hussAdjust"
     - "prtotAdjust_max"
     - "prtotAdjust_sum"
     - "prtotAdjust_avg"
     - "rldsAdjust"
     - "rsdsAdjust"
+    - "sfcWindAdjust"
     - "tasAdjust"
     - "tasmaxAdjust"
     - "tasminAdjust"
   target_column: "swi_u"
-  map_dimensions: (37, 44)
+  # The rcp_8.5 grid is 44 x 36, not the 44 x 37 of the legacy "Grand Est/" layout.
+  map_dimensions: (36, 44)
   x_dim_column: null
   y_dim_column: null
   starting_year: 2022
-  starting_month: 5
+  starting_month: 1
 
 evaluation:
-  trajectories_path: "Outputs/inference_grand_est_test.npy"
-  saving_path: "Outputs/evaluation_metrics_grand_est_test"
+  trajectories_path: "Outputs/inference_grand_est_rcp85.npy"
+  saving_path: "Outputs/evaluation_metrics_grand_est_rcp85"

@@ -37,13 +37,13 @@ what the generator learns is a training question, not an inference one.
 """
 
 import logging
-from contextlib import contextmanager
 
 import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig
 
+from utils.inference_modes import dropout_active  # noqa: F401  re-exported for callers
 from utils.stochasticity_probe import prepare, run_arm, summarise
 
 logger = logging.getLogger(__file__)
@@ -56,32 +56,6 @@ ARMS: list[tuple[str, float, str, bool]] = [
     ("ships today            std=1, inj indep, off ", 1.0, "independent", False),
     ("ships + dropout        std=1, inj indep, ON  ", 1.0, "independent", True),
 ]
-
-
-@contextmanager
-def dropout_active(model: torch.nn.Module, enabled: bool):
-    """Put only the ``nn.Dropout`` modules into training mode, leaving everything else in eval.
-
-    This is the precise question being asked: ``model.eval()`` stays in force for batch norm and
-    for stochastic depth (whose own ``training`` flag lives on a different module class and is
-    untouched here), so any spread that appears is dropout's and nothing else's.
-    """
-    if not enabled:
-        yield
-        return
-    mods = [m for m in model.modules() if isinstance(m, torch.nn.Dropout) and m.p > 0]
-    if not mods:
-        raise RuntimeError(
-            "no nn.Dropout module with p > 0 -- this checkpoint was trained with dropout "
-            "disabled everywhere, so there is nothing to switch on"
-        )
-    for m in mods:
-        m.train()
-    try:
-        yield
-    finally:
-        for m in mods:
-            m.eval()
 
 
 @hydra.main(config_path="../config", config_name="inference_swigan", version_base="1.3")
@@ -129,7 +103,7 @@ def main(cfg: DictConfig) -> None:
     else:
         drop_only = rows[1][1]
         ships, ships_drop = rows[2][1], rows[3][1]
-        print(f"\ncontrol is exactly 0 -- dropout is the only stochastic path added in arm 2.")
+        print("\ncontrol is exactly 0 -- dropout is the only stochastic path added in arm 2.")
         print(f"\n  dropout's isolated contribution   spread {drop_only['spread']:.5f}"
               f"   ({drop_only['spread'] / ships['spread'] * 100:.0f}% of what ships today)")
         print(f"  adding it to the shipping arm     {ships['spread']:.5f} -> {ships_drop['spread']:.5f}"

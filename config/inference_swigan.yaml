@@ -1,15 +1,20 @@
 dataset:
-  filepath: "Grand Est/data_train.parquet"
+  # 2021-2025 for the rcp_8.5 Grand Est grid: the 12 months of 2021 supply the SWI history
+  # that seeds the rollout (only `input_steps` of them are consumed), then 2022-2025 are
+  # generated free-running. The map dimensions are read back from the checkpoint hparams.
+  filepath: "Outputs/rcp_8.5/Grand Est/Grand_Est_2022_2025.parquet"
   fill_missing_pixels: true
+  # Must stay in the exact order used at training time: the channels are standardized by
+  # position against the feats_mean / feats_std saved in train_dataset_statistics.npz.
   input_columns:
-    - "evspsblpotAdjust-FAO"
-    - "evspsblpotAdjust-Hg0175"
+    - "evspsblpotAdjust"
     - "hussAdjust"
     - "prtotAdjust_max"
     - "prtotAdjust_sum"
     - "prtotAdjust_avg"
     - "rldsAdjust"
     - "rsdsAdjust"
+    - "sfcWindAdjust"
     - "tasAdjust"
     - "tasmaxAdjust"
     - "tasminAdjust"
@@ -17,14 +22,26 @@ dataset:
   x_dim_column: null
   y_dim_column: null
   starting_year: 2022
-  starting_month: 5
+  starting_month: 1
 
 model:
-  checkpoint_path: "swigan_batch_size_64/2026-08-17_08-13-44/checkpoints/last.ckpt"
-  train_dataset_statistics_path: "swigan_batch_size_64/2026-08-17_08-13-44/train_dataset_statistics.npz"
-  saving_path: "Outputs/inference_grand_est_test"
+  # Point these at the run trained on the rcp_8.5 data. Checkpoints from the legacy 44x37
+  # runs are not loadable here: different input channels and a different output crop.
+  checkpoint_path: "swigan_batch_size_64_1000/2026-09-04_07-26-30/checkpoints/last.ckpt"
+  train_dataset_statistics_path: "swigan_batch_size_64_1000/2026-09-04_07-26-30/train_dataset_statistics.npz"
+  saving_path: "Outputs/inference_grand_est_rcp85"
   loss_fn: "l1"
   num_trajectories: 20
   num_trajectories_per_batch: 10
   noise_std: 1.0
   dtype: "float16"
+  # Disperse on the state, not the noise. Path to the JSON written by
+  # `python -m utils.dispersion_select` -- neutral-history members, per-member history shift
+  # and the per-calendar-month offset, all chosen on windows that end before the forecast
+  # starts -- or null for the unperturbed rollout. See utils/dispersion.py for why the noise
+  # gain is the wrong knob and what these two do instead.
+  dispersion: null
+  # Leave the generator's dropout active at inference (utils/dropout_probe.py): the protocol
+  # every ensemble score in the reports used, and what a dispersion spec was selected under.
+  # false is the original path.
+  inference_dropout: false

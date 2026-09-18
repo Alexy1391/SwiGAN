@@ -1,0 +1,56 @@
+# Select the state-dispersion instrument (utils/dispersion.py) out of sample and write the spec
+# that config/inference_swigan.yaml's `model.dispersion` consumes.
+#   python -m utils.dispersion_select
+dataset:
+  # Concatenated into one continuous frame; where two files hold the same month the first
+  # listed wins. Train covers 1960-2021, the second file 2021-2025, so every January-start
+  # window from 2008 to 2024 can be seeded from its own eight observed months.
+  filepaths:
+    - "Outputs/rcp_8.5/Corse/data_train.parquet"
+    - "Outputs/rcp_8.5/Corse/Corse_2022_2025.parquet"
+  fill_missing_pixels: true
+  input_columns:
+    - "evspsblpotAdjust"
+    - "hussAdjust"
+    - "prtotAdjust_max"
+    - "prtotAdjust_sum"
+    - "prtotAdjust_avg"
+    - "rldsAdjust"
+    - "rsdsAdjust"
+    - "sfcWindAdjust"
+    - "tasAdjust"
+    - "tasmaxAdjust"
+    - "tasminAdjust"
+  target_column: "swi_u"
+  x_dim_column: null
+  y_dim_column: null
+model:
+  checkpoint_path: "swigan_corse_batch_size_64_1000/2026-09-14_09-03-17/checkpoints/last.ckpt"
+  train_dataset_statistics_path: "swigan_corse_batch_size_64_1000/2026-09-14_09-03-17/train_dataset_statistics.npz"
+  num_trajectories: 20
+  noise_std: 1.0
+  # Inference dropout, the protocol every ensemble score in the reports used. Set
+  # `model.inference_dropout` in config/inference_swigan.yaml to the same value when shipping.
+  dropout: true
+selection:
+  # January-start 24-month windows, every one ending before the 2024-25 test window opens.
+  # 2008-2018 are inside the training split for the weights; kept, and flagged in the module
+  # docstring, for the reason utils/noise_gain_transfer.py keeps them.
+  calibration_years: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021]
+  # Scored, never fitted on: the val window.
+  holdout_year: 2022
+  test_year: 2024
+  # The grid. Must contain (0, 0.0), the shipped ensemble.
+  neutral_members: [0, 2, 4, 6]
+  state_sd: [0.0, 0.6, 1.0, 1.4]
+  # One seed is enough to rank grid points on a 14-window pooled CRPS; the transfer is scored
+  # on three so the seed-to-seed scatter is visible next to the differences.
+  selection_seeds: [0]
+  evaluation_seeds: [0, 1, 2]
+  # Seeds the per-member history shift; the same seed is written to the spec so inference
+  # rebuilds the same ensemble.
+  member_seed: 0
+  # The acceptance band of utils/spread_shape.py: every month's spread / required inside it.
+  band: [0.8, 1.25]
+output:
+  directory: "Outputs/dispersion/corse_250ep"

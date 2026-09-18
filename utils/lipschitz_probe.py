@@ -7,8 +7,8 @@ towards 1 from whichever side it is on. If the critic sits *below* 1, the two me
 are pulling against each other and raising ``lambda_penalty`` fights the architecture
 rather than the critic.
 
-This probe reproduces the interpolation the training step uses (swigan_lit.py:424) and
-reports the distribution of ||grad_x D|| per head.
+This probe reproduces the interpolation ``TTTSWIGAN.gradient_penalty`` uses and reports
+the distribution of ||grad_x D|| per head.
 
 Usage:
     python -m utils.lipschitz_probe <run_dir> [<run_dir> ...] --out lipschitz.json
@@ -30,7 +30,8 @@ import yaml
 from torch import autograd
 from torch.utils.data import DataLoader
 
-from swigan.engines.swigan_lit import TTTSWIGAN
+from modules.masking import diff_augment_with_mask, mask_pyramid
+from swigan.engines.swigan_lit import DIFF_AUGMENT_POLICY, TTTSWIGAN
 from utils.preprocessing import (
     coerce_comma_decimal_columns,
     dataframe_to_rasters,
@@ -45,35 +46,49 @@ TRAIN_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "train_s
 
 
 def _grad_norms(
-    model: TTTSWIGAN, real: torch.Tensor, fake: torch.Tensor, head: str, augment: bool
+    model: TTTSWIGAN,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    mask: torch.Tensor,
+    head: str,
+    augment: bool,
 ) -> np.ndarray:
     """||grad_x D|| at points interpolated between real and generated maps.
 
     ``augment`` reproduces the training path: the critic step applies DiffAugment to both
-    tensors before the penalty is computed (swigan_lit.py:381), so the constraint the
-    penalty actually enforced is the augmented one. Off, this measures the trained
-    critic's sensitivity on clean inputs instead.
+    tensors before the penalty is computed, carrying the region mask through it, so the
+    constraint the penalty actually enforced is the augmented one under the union of the
+    two augmented masks. Off, this measures the trained critic's sensitivity on clean
+    inputs instead. Either way the gradient is projected onto the mask before the norm,
+    exactly as ``TTTSWIGAN.gradient_penalty`` does.
     """
-    if augment:
-        from modules.diff_augment import DiffAugment
-
-        real = DiffAugment(real.contiguous(), policy="translation,cutout")
-        fake = DiffAugment(fake.contiguous(), policy="translation,cutout")
     batch_size = real.shape[0]
+    real, mask_on_canvas = model.to_critic_canvas(real, mask)
+    fake, _ = model.to_critic_canvas(fake, mask)
+    mask = mask_on_canvas
+    if augment:
+        real, mask_real = diff_augment_with_mask(real, mask, DIFF_AUGMENT_POLICY)
+        fake, mask_fake = diff_augment_with_mask(fake, mask, DIFF_AUGMENT_POLICY)
+        mask = torch.maximum(mask_real, mask_fake)
+    else:
+        mask = mask.to(real.dtype).expand(batch_size, -1, -1, -1)
     alpha = torch.rand(batch_size, 1, 1, 1, device=real.device)
     interpolated = (alpha * real + (1 - alpha) * fake).clone().detach().requires_grad_(True)
 
-    base_output, _ = model.base_critic(interpolated)
+    levels = mask_pyramid(mask, len(model.base_critic.blocks))
+    base_output, _ = model.base_critic(interpolated, mask)
     critic = model.patch_critic if head == "patch" else model.frame_critic
-    d_interpolated, _ = critic(base_output)
+    d_interpolated, _ = critic(base_output, weight=levels[-1])
 
     # Matches gradient_penalty_reduction="mean", which is what every run since round 5
-    # uses and the only setting under which lambda means the same thing for both heads.
-    scalar_output = d_interpolated.flatten(1).mean(dim=1).sum()
+    # uses and the only setting under which lambda means the same thing for both heads:
+    # the coverage-weighted tile mean for the patch head, the scalar for the frame head.
+    scalar_output = model.patch_scalar(d_interpolated, levels[-1]).sum()
     gradients = autograd.grad(
         outputs=scalar_output, inputs=interpolated, create_graph=False, only_inputs=True
     )[0]
-    return gradients.view(batch_size, -1).norm(2, dim=-1).detach().cpu().numpy()
+    gradients = (gradients * mask).view(batch_size, -1)
+    return gradients.norm(2, dim=-1).detach().cpu().numpy()
 
 
 def probe(
@@ -137,7 +152,7 @@ def probe(
             )
         for head in ("patch", "frame"):
             collected[head].append(
-                _grad_norms(model, batch["target_maps"], fake, head, augment)
+                _grad_norms(model, batch["target_maps"], fake, batch["mask"], head, augment)
             )
 
     result: dict[str, Any] = {
@@ -178,8 +193,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results = [
-        probe(run_dir, args.data, device, args.batches, args.augment)
-        for run_dir in args.run_dirs
+        probe(run_dir, args.data, device, args.batches, args.augment) for run_dir in args.run_dirs
     ]
     with args.out.open("w") as handle:
         json.dump(results, handle, indent=2)

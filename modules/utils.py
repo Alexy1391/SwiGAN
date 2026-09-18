@@ -11,6 +11,7 @@ from torch import nn
 Channels: TypeAlias = list[int]
 
 NOISE_WEIGHT_INITS = ("randn", "zeros", "randn3")
+COHERENT_NOISE_INITS = ("zeros", "randn")
 
 
 class ModelFlavour(Enum):
@@ -78,6 +79,117 @@ def init_noise_weights(num_channels: int, mode: str = "randn") -> nn.Parameter:
     if mode == "randn3":
         return nn.Parameter(torch.randn(num_channels) * 3.0)
     return nn.Parameter(torch.randn(num_channels))
+
+
+def init_coherent_noise_weights(
+    num_channels: int, mode: str | float = "zeros"
+) -> nn.Parameter:
+    """Build the per-channel gain applied to a block's *spatially coherent* noise.
+
+    WHY THIS EXISTS. The field injected by :func:`init_noise_weights` is drawn per pixel, so
+    it is speckle: averaging it over a region drives it to zero. Measured on the Corse
+    250-epoch arm, the ensemble's region-mean spread divided by its pixel spread is 0.13-0.25,
+    while the error it is meant to span sits at 0.63-0.90 -- the truth's error is a coherent
+    displacement of the whole field and the model's ensemble is not. Reaching November's
+    required region-mean spread of 0.263 SWI through a channel that survives averaging at
+    0.25 would take a pixel spread of about 1.3 SWI on a field whose range is roughly 0 to 1,
+    so no setting of the speckle gains produces a calibrated region mean. That is why fifty
+    epochs of a proper score moved these gains along a random walk: there was no reachable
+    direction for the score to push them in.
+
+    The coherent channel is the missing mode. Its draw is constant over height and width, so
+    it passes through spatial averaging undiminished and the region-mean ensemble can be as
+    wide as the data require without the maps turning to noise.
+
+    ``mode`` selects the initialization:
+
+    a float
+        Every gain starts at this constant. THIS IS THE ONE TO FINE-TUNE WITH, and 0.1 is the
+        measured starting point -- see the warning about zero below. On the 250-epoch Corse
+        weights, 0.05 puts the ensemble's region/pixel spread ratio at 0.41, 0.1 at 0.61 and
+        0.2 at 0.77, against the 0.63-0.90 of the error being spanned, so 0.1 sits mid-range
+        with room for a proper score to push either way.
+
+    "zeros"
+        Contributes exactly nothing at step 0, which makes it the safe thing to load a
+        checkpoint with -- and a trap to train from. MEASURED: over 11 epochs of an energy
+        fine-tune at ``noise_weight_lr_scale`` 100 the gains went 0.0023 -> 0.0032 rms, a
+        growth exponent of 0.435 in the epoch count, extrapolating to 0.006 by epoch 50
+        against the ~0.1 the channel needs to do anything. That is a random walk, and the
+        reason is structural: at gain zero the coherent perturbation is independent of the
+        differences the members already have, so its first-order contribution to the score's
+        spread term averages to nothing and the benefit is second order. The origin is a
+        plateau, and a proper score cannot bootstrap the channel off it. Use a float instead.
+
+    "randn"
+        A standard normal draw at rms 1.0, for training from scratch. Far too large to drop
+        on a trained checkpoint: at gain 0.4 the region-mean spread is already 14 times the
+        shipped ensemble's.
+
+    Args:
+    ----
+        num_channels: Number of output channels of the block, one gain each.
+        mode: One of ``COHERENT_NOISE_INITS``.
+
+    Returns:
+    -------
+        A Parameter of shape (num_channels,).
+
+    """
+    if isinstance(mode, bool) or not isinstance(mode, (str, float, int)):
+        raise NotImplementedError(
+            f"Unknown coherent noise init: {mode!r}. Provide one of {COHERENT_NOISE_INITS} "
+            "or a float for a constant gain."
+        )
+    if not isinstance(mode, str):
+        return nn.Parameter(torch.full((num_channels,), float(mode)))
+    if mode not in COHERENT_NOISE_INITS:
+        raise NotImplementedError(
+            f"Unknown coherent noise init: {mode}. Please provide one of {COHERENT_NOISE_INITS}, "
+            "or a float for a constant gain."
+        )
+    if mode == "randn":
+        return nn.Parameter(torch.randn(num_channels))
+    return nn.Parameter(torch.zeros(num_channels))
+
+
+def draw_coherent_field(
+    gains: nn.Parameter | None,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Draw a block's spatially coherent noise, or None when the channel is off.
+
+    The field is (batch, channels, 1, 1) -- one draw per sample per channel, constant over
+    height and width -- so it broadcasts across the map and survives the spatial averaging
+    that reduces the per-pixel field of :func:`init_noise_weights` to nothing. See
+    :func:`init_coherent_noise_weights` for why the model needs a channel with that property.
+
+    Args:
+    ----
+        gains: The block's coherent gains, whose length gives the channel count. None when
+            the block was built without the channel, in which case nothing is drawn -- the
+            random stream is left untouched so a model without the channel is unaffected.
+        batch_size: Number of samples in the batch.
+        device: Device to draw on.
+        dtype: Dtype of the activations the field is added to.
+        mask: Region mask of shape (batch, 1, h, w), or None. When given, the field is zeroed
+            outside the region, keeping the block's invariant that everything handed to a
+            convolution is zero on the padding.
+
+    Returns:
+    -------
+        A Tensor broadcastable against (batch, channels, h, w), or None.
+
+    """
+    if gains is None:
+        return None
+    field = torch.randn((batch_size, gains.shape[0], 1, 1), device=device, dtype=dtype)
+    if mask is not None:
+        field = field * mask.to(dtype)
+    return field
 
 
 def glorot_init(m: nn.Module) -> None:

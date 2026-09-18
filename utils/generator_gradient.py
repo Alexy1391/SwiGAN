@@ -1,6 +1,6 @@
 """How much of the generator's update each loss term is responsible for.
 
-``generator_step`` builds ``loss_generator`` from four terms (swigan_lit.py:333):
+``generator_step`` builds ``loss_generator`` from four terms:
 
     -mean(D_patch(fake))  -mean(D_frame(fake))  + pixel L1  + feature matching
 
@@ -67,42 +67,17 @@ def _term_losses(
 ) -> dict[str, torch.Tensor]:
     """Return the four additive terms of ``loss_generator``, kept separate.
 
-    Mirrors ``TTTSWIGAN.generator_step`` rather than calling it, because that method
-    returns the terms already summed into one scalar.
+    ``TTTSWIGAN.generator_step`` returns each term next to their sum, so this is the exact
+    forward path the update is built from: DiffAugment with the mask carried through it,
+    the coverage-weighted patch mean, the pixel and feature distances over the region's
+    cells only.
     """
-    input_maps, target_maps = batch["input_maps"], batch["target_maps"]
-    mask, input_timestamps = batch["mask"], batch["timestamps"]
-
-    if model.transforms is not None:
-        input_maps, target_maps, mask = model.transforms(input_maps, target_maps, mask)
-
-    fake_maps = model(
-        input_maps=input_maps, input_timestamps=input_timestamps, mask=mask, noise_vector=z
-    )
-
-    from modules.diff_augment import DiffAugment
-
-    augmented_fake = DiffAugment(fake_maps.contiguous(), policy="translation,cutout")
-    augmented_real = DiffAugment(target_maps.contiguous(), policy="translation,cutout")
-
-    base_fake, features_base_fake = model.base_critic(augmented_fake)
-    patch_fake, features_patch_fake = model.patch_critic(base_fake)
-    frame_fake, features_frame_fake = model.frame_critic(base_fake)
-
-    base_real, features_base_real = model.base_critic(augmented_real)
-    _, features_patch_real = model.patch_critic(base_real)
-    _, features_frame_real = model.frame_critic(base_real)
-
+    outputs = model.generator_step(batch, z)
     return {
-        "patch": -torch.mean(patch_fake),
-        "frame": -torch.mean(frame_fake),
-        "pixel": model.hparams.image_distance_weight * model.loss_fn(fake_maps, target_maps),
-        "feature": model.hparams.feature_matching_weight
-        * (
-            model.compute_feature_loss(features_base_fake, features_base_real)
-            + model.compute_feature_loss(features_patch_fake, features_patch_real)
-            + model.compute_feature_loss(features_frame_fake, features_frame_real)
-        ),
+        "patch": outputs["patch_term"],
+        "frame": outputs["frame_term"],
+        "pixel": outputs["pixel_distance_loss"],
+        "feature": outputs["feature_loss"],
     }
 
 
@@ -138,7 +113,7 @@ def decompose(
     feature_maps, targets, timestamps, mask = dataframe_to_rasters(
         input_df, target_column, feature_columns, map_height, map_width
     )
-    splits, _ = build_train_val_test_datasets(
+    splits, statistics = build_train_val_test_datasets(
         input_maps=feature_maps,
         target_maps=targets,
         timesteps=timestamps,
@@ -152,6 +127,9 @@ def decompose(
         run_dir / "checkpoints" / checkpoint, loss_fn="l1", map_location=device
     )
     model.to(device)
+    # ``generator_step`` also logs RMSE and SMAPE in physical units, which need the
+    # training split's standardization statistics; the checkpoint does not carry them.
+    model.input_statistics = statistics
     # The generator's gradient is what it received while training, so the training-time
     # forward path is the one to measure: DiffAugment active, stochastic depth active.
     model.train()

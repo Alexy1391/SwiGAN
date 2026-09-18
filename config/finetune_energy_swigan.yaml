@@ -1,0 +1,42 @@
+# Energy-score fine-tune of the 250-epoch Corse checkpoint.
+#   python -m swigan.train --config-name finetune_energy_swigan
+# Everything not set here is config/train_swigan.yaml's. The weights come from the checkpoint;
+# the objective and the cosine schedule are this file's (see swigan/train.py, the
+# checkpoint_path branch). WHY: the L1 pixel term is minimised by the conditional median and
+# charges the generator for every noise-sensitive step, which is what trained the ensemble's
+# spread down to 0.011 SWI on the region mean against a required 0.04-0.18. The energy score
+# over a 4-sample mini-ensemble is a proper score of the whole field: it credits spread that is
+# coherent over the region, month by month, exactly where the data warrant it, and takes the
+# bias at the source rather than by a post-hoc offset. Inference-time knobs
+# (utils/dispersion.py) reach the right annual width but not the right shape -- twice too wide
+# in July-August, too narrow in November -- and the per-month test of utils/spread_shape.py,
+# logged every epoch as val/rollout_spread_shape_*, is what this run is held to.
+defaults:
+  - train_swigan
+  - _self_
+
+experiment_name: "swigan_corse_energy_finetune"
+
+train:
+  checkpoint_path: "swigan_corse_batch_size_64_1000/2026-09-14_09-03-17/checkpoints/last.ckpt"
+  num_epochs: 50
+  # K samples per input run as one generator batch of K x batch_size: 4 x 32 = 128 maps, twice
+  # the base run's generator batch. Raise batch_size back to 64 when the GPU is not shared.
+  batch_size: 32
+  ensemble_size: 4
+  loss_fn: "energy"
+  # A short cosine restart at the base run's peak rate: the objective changed, so the weights
+  # have to move, and 50 epochs to the floor is the budget the 250-epoch schedule spent on its
+  # last fifth.
+  start_lr: 1e-5
+  end_lr: 1e-7
+  # Off for the first fine-tune so the objective change is read on its own; the second run,
+  # if the regime-break bias survives, turns this on (0.25 with range [0, 1]).
+  history_dropout_prob: 0.0
+  history_dropout_range: [0.0, 1.0]
+
+logging:
+  # Select on the proper score the run is trained for, not on the mean's RMSE alone.
+  checkpoint_monitor: "val/rollout_crps"
+  save_checkpoint_every_n_epoch: 5
+  save_top_k_checkpoints: 10

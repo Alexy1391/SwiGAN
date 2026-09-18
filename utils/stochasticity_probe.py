@@ -42,6 +42,7 @@ from utils.preprocessing import (
     coerce_comma_decimal_columns,
     dataframe_to_rasters,
     fill_all_missing_pixels,
+    standardize_swi_history,
 )
 
 logger = logging.getLogger(__file__)
@@ -285,6 +286,11 @@ def prepare(cfg: DictConfig) -> dict:
     feats_mean, feats_std = model.statistics["feats_mean"], model.statistics["feats_std"]
     feature_maps = (feature_maps - feats_mean) / feats_std
     feature_maps = np.where(mask.squeeze(), feature_maps, 0.0)
+
+    # Same standardization the trainer applies to the SWI history channels -- see
+    # utils.preprocessing.standardize_swi_history. utils/epoch_sweep.py seeds through this
+    # function, so every spread, CRPS and epoch-axis figure inherits the fix.
+    starting_target_maps = standardize_swi_history(starting_target_maps, model.statistics, mask)
 
     y_true = target_maps.squeeze(1).astype(np.float32)  # (T, H, W) observed
     bool_mask = mask.squeeze(0).astype(bool) if mask.ndim == 3 else mask.squeeze().astype(bool)

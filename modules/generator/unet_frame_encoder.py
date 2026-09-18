@@ -9,8 +9,14 @@ from torchvision.ops import stochastic_depth
 
 from modules.base_conv_blocks import single_conv_block
 from modules.generator.center_block import CenterBlock
+from modules.masking import binary, generator_mask_pyramid
 from modules.scse import SCSEModule
-from modules.utils import glorot_init, init_noise_weights
+from modules.utils import (
+    draw_coherent_field,
+    glorot_init,
+    init_coherent_noise_weights,
+    init_noise_weights,
+)
 
 
 class UNetEncoderBlock(nn.Module):
@@ -27,6 +33,7 @@ class UNetEncoderBlock(nn.Module):
         normalization: str | None,
         prob: float = 1.0,
         noise_weight_init: str = "randn",
+        coherent_noise_init: str | float | None = None,
     ) -> None:
         """Initialize the input parameters.
 
@@ -37,10 +44,16 @@ class UNetEncoderBlock(nn.Module):
             dropout: Dropout rate.
             normalization: normalization: The type of normalization to apply.
                 If None, no normalization is applied. Supported normalization are
-                "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2D.
+                "batchnorm", "instancenorm" or "groupnorm"; see
+                :func:`modules.base_conv_blocks.single_conv_block`.
             prob: Survival probability for stochastic depth.
             noise_weight_init: How to initialize the per-channel noise gains. See
                 ``modules.utils.init_noise_weights``.
+            coherent_noise_init: How to initialize the per-channel gains of the spatially
+                coherent noise channel, or None to leave the channel out of the model
+                entirely -- no parameters are created, so the state dict is byte-for-byte the
+                one every round up to the 250-epoch arm wrote. See
+                ``modules.utils.init_coherent_noise_weights``.
 
         """
         super().__init__()
@@ -70,35 +83,73 @@ class UNetEncoderBlock(nn.Module):
         self.attention = SCSEModule(in_channels=out_channels)
         self.noise_weights1 = init_noise_weights(out_channels, noise_weight_init)
         self.noise_weights2 = init_noise_weights(out_channels, noise_weight_init)
+        # Registered only when asked for, so a model built without the channel keeps exactly
+        # the parameter names the existing checkpoints hold and loads them strictly.
+        if coherent_noise_init is None:
+            self.coherent_noise_weights1 = None
+            self.coherent_noise_weights2 = None
+        else:
+            self.coherent_noise_weights1 = init_coherent_noise_weights(
+                out_channels, coherent_noise_init
+            )
+            self.coherent_noise_weights2 = init_coherent_noise_weights(
+                out_channels, coherent_noise_init
+            )
         self.prob = prob
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass.
+
+        With ``weight`` the block keeps one invariant: everything it hands to a convolution
+        is zero outside the region, so a 3x3 kernel on a coastal cell sees real data and
+        zeros, exactly as it would at the border of a tight grid. That means the injected
+        noise field is masked -- there is no cell outside the region to perturb -- and the
+        block's own output is re-zeroed, because ``proj_layer`` is a 1x1 convolution *with a
+        bias* whose residual would otherwise put a constant back on the padding.
 
         Args:
         ----
             inputs: The input Tensor. Should be of shape
                 (batch_size, channels, height, width).
+            weight: Coverage weights of shape (batch_size, 1, height, width), or None to run
+                the block exactly as rounds 1-12 did.
 
         Returns:
         -------
             A Tensor of shape (batch_size, out_channels, 2 * height, 2 * width).
 
         """
+        mask = None if weight is None else binary(weight)
         noise = torch.randn(
             (inputs.shape[0], 1, inputs.shape[-2], inputs.shape[-1]), device=inputs.device
         )
+        if mask is not None:
+            noise = noise * mask
+        # One draw per sample per channel, constant over height and width: unlike `noise`
+        # above it survives spatial averaging, which is the whole point. Drawn per channel
+        # rather than shared across them -- `noise` shares one field because its spatial
+        # pattern is what it contributes, whereas a shared scalar would give the block a
+        # single coherent direction in channel space instead of a full one.
+        coherent = draw_coherent_field(
+            self.coherent_noise_weights1, inputs.shape[0], inputs.device, inputs.dtype, mask
+        )
         out = inputs
         x = self.proj_layer(out)
-        out = self.conv1(out)
+        out = self.conv1(out, mask)
         out = out + noise * self.noise_weights1[None, :, None, None]
+        if coherent is not None:
+            out = out + coherent * self.coherent_noise_weights1[None, :, None, None]
 
-        out = self.conv2(out)
+        out = self.conv2(out, mask)
         out = out + noise * self.noise_weights2[None, :, None, None]
+        if coherent is not None:
+            out = out + coherent * self.coherent_noise_weights2[None, :, None, None]
 
-        out = self.attention(out)
+        out = self.attention(out, weight)
         out = stochastic_depth(out, 1 - self.prob, mode="batch", training=self.training)
         out = out + x
+        if mask is not None:
+            out = out * mask
         return out
 
 
@@ -113,6 +164,7 @@ class UNetFrameEncoder(nn.Module):
         normalization: str | None = "batchnorm",
         apply_center_block: bool = False,
         noise_weight_init: str = "randn",
+        coherent_noise_init: str | float | None = None,
         encoder_late_dropout: float = 0.0,
     ) -> None:
         """Initialize the module.
@@ -124,10 +176,14 @@ class UNetFrameEncoder(nn.Module):
             dropout: Dropout rate.
             normalization: normalization: The type of normalization to apply.
                 If None, no normalization is applied. Supported normalization are
-                "instancenorm" for InstanceNorm2D, "batchnorm" for BatchNorm2d.
+                "batchnorm", "instancenorm" or "groupnorm"; see
+                :func:`modules.base_conv_blocks.single_conv_block`.
             apply_center_block: Whether to apply the center block at the end of the encoding.
             noise_weight_init: How to initialize the per-channel noise gains. See
                 ``modules.utils.init_noise_weights``.
+            coherent_noise_init: How to initialize the spatially coherent channel's gains, or
+                None to leave the channel out. See
+                ``modules.utils.init_coherent_noise_weights``.
             encoder_late_dropout: Dropout rate for the *last three* downsampling blocks only.
                 ``article_recherche.pdf`` §8.2.1 puts dropout in "the last three layers of the
                 downsampling phase and the first three layers of the upsampling phase", citing
@@ -158,6 +214,7 @@ class UNetFrameEncoder(nn.Module):
                     normalization=normalization,
                     prob=self.probs[idx],
                     noise_weight_init=noise_weight_init,
+                    coherent_noise_init=coherent_noise_init,
                 )
             )
 
@@ -187,27 +244,50 @@ class UNetFrameEncoder(nn.Module):
             self.center = nn.Identity()
         self.apply(glorot_init)
 
-    def forward(self, inputs: torch.Tensor) -> list[torch.Tensor]:
+    def forward(
+        self, inputs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
         """Forward pass.
 
         Args:
         ----
             inputs: Input tensor. Should be of size
                 (batch_size, channels, height, width)
+            mask: Region mask of shape (batch_size, 1, height, width) with values in {0, 1},
+                or None to run the encoder unmasked.
 
         Returns:
         -------
-            A Tensor of shape (batch_size, out_channels)
+            The output of every block plus the center block's, and the coverage pyramid the
+            decoder needs to normalize each of its levels over the same cells -- or None
+            when no mask was given.
 
         """
+        if mask is None:
+            levels = None
+            block_weights: list[torch.Tensor | None] = [None] * (len(self.layers) + 1)
+        else:
+            levels = generator_mask_pyramid(mask, len(self.layers))
+            block_weights = list(levels)
+
         out = inputs
         outputs = []
-        for _, (block, downsample) in enumerate(
-            zip(self.layers, self.downsample_layers, strict=True)
+        for block, downsample, weight, next_weight in zip(
+            self.layers,
+            self.downsample_layers,
+            block_weights[:-1],
+            block_weights[1:],
+            strict=True,
         ):
-            out = block(out)
+            out = block(out, weight)
             outputs.append(out)
-            out = downsample(out)
-        out = self.center(out)
+            # The downsample is a 2x2 stride-2 convolution, so its normalization and its
+            # re-zeroing belong to the *next* level of the pyramid, not this one.
+            out = downsample(out, None if next_weight is None else binary(next_weight))
+        center_weight = block_weights[-1]
+        if center_weight is not None and getattr(self.center, "accepts_mask", False):
+            out = self.center(out, binary(center_weight))
+        else:
+            out = self.center(out)
         outputs.append(out)
-        return outputs
+        return outputs, levels

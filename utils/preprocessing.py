@@ -1,5 +1,7 @@
 """Module containing preprocessing methods."""
 
+from collections.abc import Mapping
+
 import numpy as np
 import pandas as pd
 
@@ -58,6 +60,51 @@ def dataframe_to_rasters(
     timestamps = np.stack(timestamps, axis=0).astype(np.float32)
 
     return input_maps, target_maps, timestamps, mask
+
+
+def single_channel_statistic(statistics: Mapping[str, np.ndarray], name: str) -> float:
+    """Read one standardization statistic as a scalar.
+
+    They are saved with ``keepdims=True``, i.e. shaped ``(1, 1, 1, 1)``. The target has a single
+    channel, so the value is a scalar; used at its saved shape it would broadcast a
+    ``(T, H, W)`` stack of maps up to 4-D and silently change what every consumer downstream
+    stacks and reduces over.
+    """
+    value = np.asarray(statistics[name], dtype=np.float32).reshape(-1)
+    if value.size != 1:
+        raise ValueError(
+            f"'{name}' holds {value.size} values, so the target is not single-channel and this "
+            "standardization would be wrong. The SwiGAN generator assumes output_channels=1."
+        )
+    return float(value[0])
+
+
+def standardize_swi_history(
+    history_maps: np.ndarray,
+    statistics: Mapping[str, np.ndarray],
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Put raw SWI frames into the standardized space the generator's history channels expect.
+
+    WHY THIS EXISTS. The generator's last ``num_input_steps`` input channels are SWI frames, and
+    training feeds them STANDARDIZED: ``utils/swi_dataset.py`` applies
+    ``np.where(mask, (targets - targets_mean) / targets_std, 0.0)`` to every split before a
+    ``SWIDataset`` ever sees it. ``dataframe_to_rasters`` returns RAW SWI, so an inference path
+    that seeds its rollout straight from a dataframe hands the model a unit system it was never
+    fitted on -- and only for the first ``num_input_steps`` steps, because from then on the
+    buffer holds the generator's own output, which is already standardized.
+
+    On Corse (``targets_mean`` 0.536, ``targets_std`` 0.385) that mistake fed the history a
+    +0.90 sigma offset at 0.385x contrast: a bone-dry August of -0.03 reached the generator as
+    0.52, i.e. as average soil.
+
+    ORDER MATTERS, and it matches the trainer: standardize first, THEN zero the padding, so a
+    masked-out cell reads as 0 -- the training mean -- and not as
+    ``(0 - targets_mean) / targets_std``.
+    """
+    mean = single_channel_statistic(statistics, "targets_mean")
+    std = single_channel_statistic(statistics, "targets_std")
+    return np.where(np.squeeze(mask).astype(bool), (history_maps - mean) / std, 0.0)
 
 
 def fill_all_missing_pixels(

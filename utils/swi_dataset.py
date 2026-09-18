@@ -18,6 +18,8 @@ class SWIDataset(Dataset):
         mask: np.ndarray,
         timestamps: np.ndarray,
         num_input_steps: int,
+        history_dropout_prob: float = 0.0,
+        history_dropout_range: tuple[float, float] = (0.0, 1.0),
     ) -> None:
         """Dataset for the maps.
 
@@ -29,9 +31,31 @@ class SWIDataset(Dataset):
                 Of shape (1, H, W).
             timestamps: The time vectors corresponding to each map.
             num_input_steps: Number of input timesteps for the data generator.
+            history_dropout_prob: Share of samples whose ``num_input_steps`` SWI history
+                frames are scaled by one random factor before being handed out. 0.0 is
+                every round so far. WHY: on Corse the history vetoes the covariates at a
+                regime break -- October 2024's +1.1 sigma rainfall reached the model and a
+                bone-dry eight-month history overrode it, while the same month with a
+                neutral history landed on the observation. Showing the model a damped
+                history against the true target teaches it how much to weigh the covariates
+                when the state is uncertain, which is what the neutral-history members of
+                ``utils/dispersion.py`` patch at inference. Training split only.
+            history_dropout_range: The factor is drawn uniformly from this interval; 0 is
+                the climatologically neutral history (the training mean, in standardised
+                units), 1 leaves the sample untouched.
 
         """
         self.num_input_steps = num_input_steps
+        self.history_dropout_prob = float(history_dropout_prob)
+        low, high = (float(v) for v in history_dropout_range)
+        if not 0.0 <= self.history_dropout_prob <= 1.0:
+            raise ValueError(f"history_dropout_prob must be in [0, 1], got {history_dropout_prob}")
+        if not 0.0 <= low <= high <= 1.0:
+            raise ValueError(
+                "history_dropout_range must satisfy 0 <= low <= high <= 1, "
+                f"got {history_dropout_range}"
+            )
+        self.history_dropout_range = (low, high)
         self.mask = torch.tensor(mask).float()
         self.samples = self._build_samples(
             torch.tensor(maps_feats) * self.mask[None, ...],
@@ -68,8 +92,16 @@ class SWIDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Get a sample from the dataset."""
+        input_maps = self.samples[idx]["input_maps"]
+        # torch's RNG rather than numpy's: DataLoader re-seeds it per worker, so forked
+        # workers do not replay one another's draws.
+        if self.history_dropout_prob > 0 and float(torch.rand(())) < self.history_dropout_prob:
+            low, high = self.history_dropout_range
+            factor = low + (high - low) * float(torch.rand(()))
+            input_maps = input_maps.clone()
+            input_maps[-self.num_input_steps :] *= factor
         return {
-            "input_maps": self.samples[idx]["input_maps"],
+            "input_maps": input_maps,
             "timestamps": self.samples[idx]["timestamps"],
             "target_maps": self.samples[idx]["target_maps"],
             "mask": self.mask,
@@ -84,6 +116,8 @@ def build_train_val_test_datasets(
     train_ratio: float,
     val_ratio: float,
     num_input_steps: int,
+    history_dropout_prob: float = 0.0,
+    history_dropout_range: tuple[float, float] = (0.0, 1.0),
 ) -> tuple[dict[str, SWIDataset], dict[str, np.ndarray]]:
     """Build the train validation and test datasets.
 
@@ -99,6 +133,8 @@ def build_train_val_test_datasets(
             Used for training, validation and test datasets.
         num_output_steps_train: Number of output timesteps in the training dataset.
         num_output_steps_val: Number of output timesteps in the validation and test dataset.
+        history_dropout_prob: See :class:`SWIDataset`. Applied to the training split only.
+        history_dropout_range: See :class:`SWIDataset`.
 
     Returns:
     -------
@@ -180,6 +216,8 @@ def build_train_val_test_datasets(
         timestamps=timestamps_train,
         mask=mask,
         num_input_steps=num_input_steps,
+        history_dropout_prob=history_dropout_prob,
+        history_dropout_range=history_dropout_range,
     )
     val_dataset = SWIDataset(
         maps_feats=maps_val,
@@ -205,3 +243,80 @@ def build_train_val_test_datasets(
             "targets_std": targets_std_value,
         },
     )
+
+
+def build_datasets_from_split_rasters(
+    split_maps: dict[str, np.ndarray],
+    split_targets: dict[str, np.ndarray],
+    split_timesteps: dict[str, np.ndarray],
+    mask: np.ndarray,
+    num_input_steps: int,
+    history_dropout_prob: float = 0.0,
+    history_dropout_range: tuple[float, float] = (0.0, 1.0),
+) -> tuple[dict[str, SWIDataset], dict[str, np.ndarray]]:
+    """Build datasets from rasters that are already split into train/val/test.
+
+    Same standardization as :func:`build_train_val_test_datasets` -- per-channel mean and
+    standard deviation taken over the *training* split only, with masked-out pixels excluded
+    from the statistics and zeroed afterwards -- but the chronological split is taken from the
+    caller instead of from ratios. Use it when the splits ship as separate files.
+
+    Args:
+    ----
+        split_maps: The input rasters per split. Must contain a "train" key.
+        split_targets: The target rasters per split, same keys as ``split_maps``.
+        split_timesteps: The time vectors per split, same keys as ``split_maps``.
+        mask: A boolean mask representing the region of interest, shared by every split.
+        num_input_steps: Number of timesteps to consider as input.
+        history_dropout_prob: See :class:`SWIDataset`. Applied to the "train" split only.
+        history_dropout_range: See :class:`SWIDataset`.
+
+    Returns:
+    -------
+        Two dictionaries: the datasets keyed by split name, and the standardization
+        statistics of the training split.
+
+    """
+    if "train" not in split_maps:
+        raise ValueError("'split_maps' must contain a 'train' key to standardize against.")
+    if set(split_maps) != set(split_targets) or set(split_maps) != set(split_timesteps):
+        raise ValueError(
+            "'split_maps', 'split_targets' and 'split_timesteps' must share the same keys."
+        )
+
+    squeezed_mask = mask.squeeze()
+
+    def unmasked(maps: np.ndarray) -> np.ndarray:
+        return np.where(squeezed_mask, maps, np.nan)
+
+    def standardize(maps: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+        return np.where(squeezed_mask, (unmasked(maps) - mean) / std, 0.0)
+
+    feats_mean, feats_std = (
+        np.nanmean(unmasked(split_maps["train"]), axis=(0, -2, -1), keepdims=True),
+        np.nanstd(unmasked(split_maps["train"]), axis=(0, -2, -1), keepdims=True),
+    )
+    targets_mean, targets_std = (
+        np.nanmean(unmasked(split_targets["train"]), axis=(0, -2, -1), keepdims=True),
+        np.nanstd(unmasked(split_targets["train"]), axis=(0, -2, -1), keepdims=True),
+    )
+
+    datasets = {
+        name: SWIDataset(
+            maps_feats=standardize(split_maps[name], feats_mean, feats_std),
+            target_maps=standardize(split_targets[name], targets_mean, targets_std),
+            timestamps=split_timesteps[name],
+            mask=mask,
+            num_input_steps=num_input_steps,
+            history_dropout_prob=history_dropout_prob if name == "train" else 0.0,
+            history_dropout_range=history_dropout_range,
+        )
+        for name in split_maps
+    }
+
+    return datasets, {
+        "feats_mean": feats_mean,
+        "feats_std": feats_std,
+        "targets_mean": targets_mean,
+        "targets_std": targets_std,
+    }
