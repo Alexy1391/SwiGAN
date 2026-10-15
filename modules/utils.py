@@ -12,6 +12,10 @@ Channels: TypeAlias = list[int]
 
 NOISE_WEIGHT_INITS = ("randn", "zeros", "randn3")
 COHERENT_NOISE_INITS = ("zeros", "randn")
+# The two injection sites of every encoder and decoder block, named so that
+# ``utils.coherent_channel`` can find the gains on a built model without walking
+# parameter names.
+COHERENT_GAIN_ATTRIBUTES = ("coherent_noise_weights1", "coherent_noise_weights2")
 
 
 class ModelFlavour(Enum):

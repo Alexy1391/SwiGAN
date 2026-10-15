@@ -19,8 +19,10 @@ Inference only. Run with the training config's overrides plus the checkpoint:
         train.checkpoint_path=<run>/checkpoints/last.ckpt
 
 ``rollout.num_members``, ``rollout.noise_std``, ``rollout.seed`` and ``rollout.num_steps`` are
-read from the same ``rollout`` section training uses, so a number printed here is the number
-the callback would have logged.
+read from the same ``rollout`` section training uses, and the generator's BatchNorm is
+recalibrated as ``batchnorm_recalibration`` says, so a number printed here is the number the
+callback would have logged. ``batchnorm_recalibration.enabled=false`` scores the checkpoint's
+stored statistics instead.
 """
 
 import logging
@@ -32,6 +34,7 @@ from omegaconf import DictConfig
 
 from swigan.engines.swigan_lit import TTTSWIGAN
 from swigan.train import build_splits
+from utils.batchnorm_recalibration import recalibrate_batchnorm
 from utils.rollout import free_running_rollout, summarise_rollout
 
 logger = logging.getLogger(__file__)
@@ -59,6 +62,20 @@ def main(cfg: DictConfig) -> None:
     model = TTTSWIGAN.load_from_checkpoint(checkpoint_path, loss_fn=train_cfg["loss_fn"])
     model.input_statistics = statistics
     model.to(device)
+
+    # As the callback does at the start of every validation epoch, so a checkpoint saved before
+    # the recalibration existed is scored on its weights rather than on its last batches.
+    recalibration_cfg = cfg.get("batchnorm_recalibration")
+    if recalibration_cfg is not None and recalibration_cfg["enabled"]:
+        recalibrate_batchnorm(
+            model,
+            splits["train"],
+            batch_size=train_cfg["batch_size"],
+            num_passes=recalibration_cfg["num_passes"],
+            seed=recalibration_cfg["seed"],
+            device=device,
+        )
+        logger.info("Recalibrated the generator's BatchNorm on the training split.")
 
     results = {}
     for split in SPLITS:

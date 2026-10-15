@@ -18,7 +18,11 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from swigan.engines.swigan_lit import TTTSWIGAN
-from utils.callbacks import RandomTimeStepMapCallback, RolloutMetricsCallback
+from utils.callbacks import (
+    BatchNormRecalibrationCallback,
+    RandomTimeStepMapCallback,
+    RolloutMetricsCallback,
+)
 from utils.preprocessing import (
     coerce_comma_decimal_columns,
     dataframe_to_rasters,
@@ -216,12 +220,15 @@ def main(cfg: DictConfig) -> None:
     splits, statistics, map_height, map_width = build_splits(dataset_cfg, train_cfg)
     feature_columns = dataset_cfg["input_columns"]
 
-    # Create the dataloaders
+    # Create the dataloaders. drop_last: 736 training samples leave a random half batch of 32
+    # at the end of every epoch, and that half batch was the last thing the generator's
+    # BatchNorm running statistics saw before validation scored with them.
     train = DataLoader(
         splits["train"],
         batch_size=train_cfg["batch_size"],
         shuffle=True,
         num_workers=train_cfg["num_workers"],
+        drop_last=True,
     )
     val = DataLoader(
         splits["val"],
@@ -385,6 +392,24 @@ def main(cfg: DictConfig) -> None:
             num_months_per_plot=logging_cfg["num_months_per_plots"],
         ),
     ]
+
+    recalibration_cfg = cfg.get("batchnorm_recalibration")
+    if recalibration_cfg is not None and recalibration_cfg["enabled"]:
+        # Its hook runs at validation epoch start, so whatever the list order it comes before
+        # the rollout below and ModelCheckpoint, which both read the statistics it replaces.
+        logger.info(
+            f"Recalibrating the generator's BatchNorm before every validation epoch: "
+            f"{recalibration_cfg['num_passes']} pass(es) over the {len(splits['train'])} "
+            f"training samples."
+        )
+        callbacks.append(
+            BatchNormRecalibrationCallback(
+                dataset=splits["train"],
+                batch_size=train_cfg["batch_size"],
+                num_passes=recalibration_cfg["num_passes"],
+                seed=recalibration_cfg["seed"],
+            )
+        )
 
     if rollout_enabled:
         # The free-running counterpart of val/generator_rmse. On the chronological layout the

@@ -13,6 +13,8 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from swigan.engines.swigan_lit import TTTSWIGAN
+from utils.batchnorm_recalibration import recalibrate_batchnorm
+from utils.coherent_channel import coherent_gains, load_with_coherent_channel
 from utils.dispersion import (
     apply_seasonal_offsets,
     load_dispersion_spec,
@@ -26,6 +28,7 @@ from utils.preprocessing import (
     fill_all_missing_pixels,
     standardize_swi_history,
 )
+from utils.swi_dataset import SWIDataset
 
 logger = logging.getLogger(__file__)
 
@@ -106,6 +109,78 @@ def compute_trajectory_iterative(
     return outputs.astype(dtype)
 
 
+def recalibrate_on_training_split(
+    model: LightningModule,
+    recalibration: DictConfig | None,
+    dataset_cfg: DictConfig,
+    mask: np.ndarray,
+    num_input_steps: int,
+) -> None:
+    """Recalibrate the generator's BatchNorm on the split the checkpoint trained on.
+
+    See :mod:`utils.batchnorm_recalibration`. The split is standardized against the saved
+    ``train_dataset_statistics.npz`` rather than statistics recomputed from the file, as training
+    standardized it, and a file from another region is refused on its mask. ``recalibration``
+    None keeps the checkpoint's stored statistics.
+    """
+    if not recalibration:
+        return
+    # Imported here: swigan.train imports utils.callbacks, whose utils.rollout imports come back
+    # round to this module through utils.stochasticity_probe.
+    from swigan.train import load_rasters
+
+    filepath = recalibration["filepath"]
+    hint = (
+        "Point 'model.batchnorm_recalibration.filepath' at the training split of the "
+        "checkpoint's own region."
+    )
+    map_height, map_width = model.hparams.input_map_dims
+    try:
+        feature_maps, targets, timestamps, train_mask = load_rasters(
+            filepath=filepath,
+            dataset_cfg=dataset_cfg,
+            feature_columns=dataset_cfg["input_columns"],
+            target_column=dataset_cfg["target_column"],
+            map_height=map_height,
+            map_width=map_width,
+            x_dim_col=dataset_cfg["x_dim_column"] if dataset_cfg["x_dim_column"] else "x",
+            y_dim_col=dataset_cfg["y_dim_column"] if dataset_cfg["y_dim_column"] else "y",
+        )
+    except ValueError as err:
+        # What another region's file looks like: not one month fits the checkpoint's grid.
+        raise ValueError(
+            f"Could not read '{filepath}' on the checkpoint's {map_height}x{map_width} grid. {hint}"
+        ) from err
+    if not np.array_equal(train_mask, mask):
+        raise ValueError(
+            f"'{filepath}' does not share the region mask of '{dataset_cfg['filepath']}'. {hint}"
+        )
+    region = mask.squeeze().astype(bool)
+    statistics = model.statistics
+
+    def standardize(maps: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+        return np.where(region, (maps - mean) / std, 0.0)
+
+    train_dataset = SWIDataset(
+        maps_feats=standardize(feature_maps, statistics["feats_mean"], statistics["feats_std"]),
+        target_maps=standardize(targets, statistics["targets_mean"], statistics["targets_std"]),
+        mask=mask,
+        timestamps=timestamps,
+        num_input_steps=num_input_steps,
+    )
+    num_layers = recalibrate_batchnorm(
+        model,
+        train_dataset,
+        batch_size=recalibration["batch_size"],
+        num_passes=recalibration["num_passes"],
+        seed=recalibration["seed"],
+    )
+    logger.info(
+        f"Recalibrated {num_layers} generator BatchNorms on {len(train_dataset)} samples of "
+        f"'{filepath}'."
+    )
+
+
 @hydra.main(config_path="../config", config_name="inference_swigan", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     """Train the model."""
@@ -177,10 +252,21 @@ def main(cfg: DictConfig) -> None:
     if not os.path.exists(model_cfg["checkpoint_path"]):
         raise ValueError(f"No checkpoints found at '{model_cfg['checkpoint_path']}'")
 
+    # Read before the model is built: a spec that selected a coherent amplitude needs the
+    # channel to exist on the model, and a checkpoint written before the channel has none.
+    dispersion = model_cfg.get("dispersion")
+    spec = load_dispersion_spec(dispersion) if dispersion else None
+    coherent_amplitude = None if spec is None else spec["coherent_amplitude"]
+
     logger.info(f"Loading the model from '{model_cfg['checkpoint_path']}'...")
-    model = TTTSWIGAN.load_from_checkpoint(
-        model_cfg["checkpoint_path"], loss_fn="l1", device=device
-    )
+    if coherent_amplitude is None:
+        model = TTTSWIGAN.load_from_checkpoint(
+            model_cfg["checkpoint_path"], loss_fn="l1", device=device
+        )
+    else:
+        model = load_with_coherent_channel(
+            model_cfg["checkpoint_path"], loss_fn="l1", device=device
+        )
     train_dataset_statistics = np.load(model_cfg["train_dataset_statistics_path"])
     model.statistics = train_dataset_statistics
 
@@ -205,6 +291,14 @@ def main(cfg: DictConfig) -> None:
         1
     )  # the first targets are the initial ones
 
+    # Every trajectory below normalizes by the generator's BatchNorm running statistics, and a
+    # checkpoint saved without `batchnorm_recalibration` stores ones dominated by the last
+    # training batches of its epoch -- about +-0.05 of rollout RMSE on a region the size of
+    # Bourgogne-Franche-Comte. Recompute them on the training split first.
+    recalibrate_on_training_split(
+        model, model_cfg.get("batchnorm_recalibration"), dataset_cfg, mask, num_input_steps
+    )
+
     # Prepare dataset
     mean_value, std_value = model.statistics["feats_mean"], model.statistics["feats_std"]
     feature_maps = (feature_maps - mean_value) / std_value
@@ -225,9 +319,8 @@ def main(cfg: DictConfig) -> None:
 
     # Disperse on the state, not the noise: k neutral-history members and a per-member history
     # shift, selected out of sample by utils/dispersion_select.py, plus the seasonal offset it
-    # fitted. Null reproduces the unperturbed rollout bit for bit.
-    dispersion = model_cfg.get("dispersion")
-    spec = load_dispersion_spec(dispersion) if dispersion else None
+    # fitted -- and the generator's coherent-channel amplitude selected beside them. Null
+    # reproduces the unperturbed rollout bit for bit.
     scale, shift = (
         member_perturbations(
             num_trajectories, spec["neutral_members"], spec["state_sd"], spec["member_seed"]
@@ -239,7 +332,8 @@ def main(cfg: DictConfig) -> None:
         logger.info(
             f"State dispersion: {spec['neutral_members']} neutral members, state sd "
             f"{spec['state_sd']}, seasonal offsets "
-            f"{'on' if spec['seasonal_offsets'] is not None else 'off'}."
+            f"{'on' if spec['seasonal_offsets'] is not None else 'off'}, coherent amplitude "
+            f"{'as in the checkpoint' if coherent_amplitude is None else coherent_amplitude}."
         )
 
     trajectories = []
@@ -254,7 +348,7 @@ def main(cfg: DictConfig) -> None:
     )
     for idx in tqdm(range(0, num_trajectories, batch_size)):
         z_vec = z[:, idx : idx + batch_size].to(device)
-        with dropout_active(model, inference_dropout):
+        with dropout_active(model, inference_dropout), coherent_gains(model, coherent_amplitude):
             traj = compute_trajectory_iterative(
                 model=model,
                 inputs_maps=torch.tensor(feature_maps * mask.squeeze(), device=device).float(),

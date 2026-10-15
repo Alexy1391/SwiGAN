@@ -7,12 +7,21 @@ same rule applies to the two state knobs of :mod:`utils.dispersion` and to the p
 and this module applies it. Nothing below is selected on the test window; the test window is
 scored once, at the end, with parameters fixed beforehand.
 
-WHAT IS SELECTED. A grid over ``neutral_members`` x ``state_sd``, one 20-member rollout per
-calibration window per point. For every grid point the seasonal offset is fitted LEAVE-ONE-
-WINDOW-OUT inside the calibration set -- fitted on thirteen windows, applied to the fourteenth --
-so the CRPS the selection reads is the CRPS of the corrected ensemble on a window the correction
-never saw. The point with the lowest pooled corrected CRPS wins; the raw argmin is reported
-beside it. The offset that ships is then refitted on all calibration windows for the winner.
+WHAT IS SELECTED. A grid over ``coherent_amplitude`` x ``neutral_members`` x ``state_sd``, one
+20-member rollout per calibration window per point. For every grid point the seasonal offset is
+fitted LEAVE-ONE-WINDOW-OUT inside the calibration set -- fitted on thirteen windows, applied to
+the fourteenth -- so the CRPS the selection reads is the CRPS of the corrected ensemble on a
+window the correction never saw. The point with the lowest pooled corrected CRPS wins; the raw
+argmin is reported beside it. The offset that ships is then refitted on all calibration windows
+for the winner.
+
+WHY THE THREE AXES ARE SWEPT TOGETHER. The first two perturb the state the generator conditions
+on; the third is the gain of the generator's own spatially coherent noise channel, which
+:mod:`utils.coherent_channel` drives. All three buy the same thing -- a displacement of the
+whole field that survives spatial averaging -- so they are substitutes, not independent knobs,
+and selecting one with the others held at a guess picks a point on a slice rather than the
+argmin. Amplitude 0 is the channel off and reproduces the shipped ensemble bit for bit, so the
+grid still contains its own baseline.
 
 WHAT IS REPORTED ON TEST. Four arms, three rollout seeds each: the shipped ensemble, the
 shipped ensemble plus the offset, the selected point, the selected point plus the offset --
@@ -50,6 +59,7 @@ from omegaconf import DictConfig
 
 from swigan.engines.swigan_lit import TTTSWIGAN
 from swigan.inference import compute_trajectory_iterative
+from utils.coherent_channel import coherent_gains, load_with_coherent_channel
 from utils.dispersion import (
     apply_seasonal_offsets,
     dispersion_spec,
@@ -77,7 +87,15 @@ from utils.spread_shape import (
 logger = logging.getLogger(__file__)
 
 STEPS = 24
-SHIPPED: tuple[int, float] = (0, 0.0)
+# (coherent_amplitude, neutral_members, state_sd). The baseline point of the grid, and the
+# shipped ensemble: the coherent channel detached, no neutral members, no state perturbation.
+Point = tuple[float | None, int, float]
+SHIPPED: Point = (0.0, 0, 0.0)
+
+
+def amplitude_label(amplitude: float | None) -> str:
+    """How an amplitude prints: ``own`` is the checkpoint's own gains, left untouched."""
+    return "own" if amplitude is None else f"{amplitude:.2f}"
 
 
 def load_continuous_frame(
@@ -174,14 +192,20 @@ def rollout_window(
     rasters: WindowedRasters,
     window: dict[str, Any],
     num_members: int,
-    neutral_members: int,
-    state_sd: float,
+    point: Point,
     member_seed: int,
     seed: int,
     noise_std: float,
     device: torch.device | str,
 ) -> np.ndarray:
-    """One ensemble over one window through the shipping rollout. Returns ``(M, T, P)``, SWI."""
+    """One ensemble over one window through the shipping rollout. Returns ``(M, T, P)``, SWI.
+
+    The coherent amplitude is set for the duration of the rollout and restored after it, so a
+    grid sweep never leaves the model holding a previous point's gains. At amplitude 0 the
+    channel is detached rather than zeroed, which leaves the random stream identical to a model
+    built without it -- the shipped ensemble reproduces bit for bit.
+    """
+    amplitude, neutral_members, state_sd = point
     scale, shift = member_perturbations(num_members, neutral_members, state_sd, member_seed)
     z = (
         torch.randn(
@@ -193,17 +217,18 @@ def rollout_window(
         * noise_std
     )
     torch.manual_seed(seed)  # the in-forward injection draws
-    trajectories = compute_trajectory_iterative(
-        model=model,
-        inputs_maps=torch.tensor(window["feats"], device=device),
-        starting_target_maps=torch.tensor(window["history"], device=device),
-        input_timestamps=torch.tensor(window["timestamps"].squeeze(), device=device).long(),
-        mask=torch.tensor(rasters.mask, device=device),
-        z=z.to(device),
-        dtype=np.float32,
-        history_scale=scale,
-        history_shift=shift,
-    )
+    with coherent_gains(model, amplitude):
+        trajectories = compute_trajectory_iterative(
+            model=model,
+            inputs_maps=torch.tensor(window["feats"], device=device),
+            starting_target_maps=torch.tensor(window["history"], device=device),
+            input_timestamps=torch.tensor(window["timestamps"].squeeze(), device=device).long(),
+            mask=torch.tensor(rasters.mask, device=device),
+            z=z.to(device),
+            dtype=np.float32,
+            history_scale=scale,
+            history_shift=shift,
+        )
     return trajectories[:, :, 0][:, :, rasters.bool_mask]
 
 
@@ -258,7 +283,6 @@ def acceptance(
     return out
 
 
-Point = tuple[int, float]
 Members = dict[Point, list[list[np.ndarray]]]  # point -> window -> seed -> (M, T, P)
 
 
@@ -278,16 +302,20 @@ def evaluate_grid(
     """
     members: Members = {}
     raw: dict[Point, list[dict[str, float]]] = {}
-    for k, sd in grid:
-        members[(k, sd)] = []
-        raw[(k, sd)] = []
+    for point in grid:
+        members[point] = []
+        raw[point] = []
         for window in calib:
-            per_seed = [run(window, k, sd, seed) for seed in seeds]
-            members[(k, sd)].append(per_seed)
-            raw[(k, sd)].append(
+            per_seed = [run(window, point, seed) for seed in seeds]
+            members[point].append(per_seed)
+            raw[point].append(
                 pooled([window_metrics(m, window["truth"], target_std) for m in per_seed])
             )
-        logger.info(f"  k={k} sd={sd}: pooled raw CRPS {pooled(raw[(k, sd)])['crps']:.4f}")
+        amplitude, k, sd = point
+        logger.info(
+            f"  a={amplitude_label(amplitude)} k={k} sd={sd}: pooled raw CRPS "
+            f"{pooled(raw[point])['crps']:.4f}"
+        )
 
     corrected: dict[Point, list[dict[str, float]]] = {}
     for point, per_window in members.items():
@@ -329,25 +357,27 @@ def report_grid(
     title: str,
 ) -> None:
     """Print the grid table, pooled over the calibration windows."""
-    print("\n" + "=" * 118)
-    print(title.center(118))
-    print("=" * 118)
+    print("\n" + "=" * 124)
+    print(title.center(124))
+    print("=" * 124)
     print(
-        f"{'k':>3s} {'sd':>5s} | {'raw CRPS':>9s} {'vs ship':>8s} {'RMSE':>7s} {'s/s':>6s} "
-        f"{'cover':>6s} | {'corr CRPS':>9s} {'vs ship':>8s} {'RMSE':>7s} {'s/s':>6s} "
-        f"{'cover':>6s} {'|bias|':>7s}"
+        f"{'ampl':>5s} {'k':>3s} {'sd':>5s} | {'raw CRPS':>9s} {'vs ship':>8s} {'RMSE':>7s} "
+        f"{'s/s':>6s} {'cover':>6s} | {'corr CRPS':>9s} {'vs ship':>8s} {'RMSE':>7s} "
+        f"{'s/s':>6s} {'cover':>6s} {'|bias|':>7s}"
     )
     ship_raw = table[SHIPPED]["raw"]["crps"]
     ship_corr = table[SHIPPED]["corrected"]["crps"]
-    for k, sd in grid:
-        r, c = table[(k, sd)]["raw"], table[(k, sd)]["corrected"]
+    for point in grid:
+        amplitude, k, sd = point
+        r, c = table[point]["raw"], table[point]["corrected"]
         flag = ""
-        if (k, sd) == best:
+        if point == best:
             flag = " <- selected"
-        elif (k, sd) == best_raw:
+        elif point == best_raw:
             flag = " <- raw argmin"
         print(
-            f"{k:3d} {sd:5.2f} | {r['crps']:9.4f} {100 * (r['crps'] / ship_raw - 1):+7.1f}% "
+            f"{amplitude_label(amplitude):>5s} {k:3d} {sd:5.2f} | "
+            f"{r['crps']:9.4f} {100 * (r['crps'] / ship_raw - 1):+7.1f}% "
             f"{r['rmse']:7.4f} {r['spread_skill']:6.3f} {100 * r['coverage']:5.1f}% | "
             f"{c['crps']:9.4f} {100 * (c['crps'] / ship_corr - 1):+7.1f}% {c['rmse']:7.4f} "
             f"{c['spread_skill']:6.3f} {100 * c['coverage']:5.1f}% {c['abs_bias']:7.4f}{flag}"
@@ -363,14 +393,14 @@ def score_transfer(
     target_std: float,
 ) -> dict[str, Any]:
     """Score the fixed arms on one window the selection never saw, and print the table."""
-    print("\n" + "=" * 118)
+    print("\n" + "=" * 124)
     print(
         f"{name.upper()}  {window['label']}  -- {len(seeds)} rollout seeds, every parameter "
-        "fixed on the calibration windows".center(118)
+        "fixed on the calibration windows".center(124)
     )
-    print("=" * 118)
+    print("=" * 124)
     print(
-        f"{'arm':<28s} {'CRPS':>8s} {'vs ship':>8s} {'RMSE mean':>10s} {'vs ship':>8s} "
+        f"{'arm':<34s} {'CRPS':>8s} {'vs ship':>8s} {'RMSE mean':>10s} {'vs ship':>8s} "
         f"{'s/s':>7s} {'cover':>7s} {'bias':>8s} {'reliab':>7s}"
     )
     result: dict[str, Any] = {"window": window["label"], "arms": {}}
@@ -378,7 +408,7 @@ def score_transfer(
     for label, point, offsets in arms:
         rows = []
         for seed in seeds:
-            ens = run(window, point[0], point[1], seed)
+            ens = run(window, point, seed)
             if offsets is not None:
                 ens = apply_seasonal_offsets(ens, window["months"], offsets)
             rows.append(window_metrics(ens, window["truth"], target_std))
@@ -388,7 +418,7 @@ def score_transfer(
         result["arms"][label] = m
         base = base or m
         print(
-            f"{label:<28s} {m['crps']:8.4f} {100 * (m['crps'] / base['crps'] - 1):+7.1f}% "
+            f"{label:<34s} {m['crps']:8.4f} {100 * (m['crps'] / base['crps'] - 1):+7.1f}% "
             f"{m['rmse']:10.4f} {100 * (m['rmse'] / base['rmse'] - 1):+7.1f}% "
             f"{m['spread_skill']:7.3f} {100 * m['coverage']:6.1f}% {m['bias']:+8.4f} "
             f"{m['reliability']:7.3f}"
@@ -403,12 +433,12 @@ def report_acceptance(
     band: tuple[float, float],
 ) -> dict[str, Any]:
     """Print the monthly spread / required tables and verdicts, pooled over the calibration set."""
-    print("\n" + "=" * 118)
+    print("\n" + "=" * 124)
     print(
         f"ACCEPTANCE: monthly spread / required, pooled over the {len(calib)} calibration "
-        f"windows; band {band[0]}-{band[1]}".center(118)
+        f"windows; band {band[0]}-{band[1]}".center(124)
     )
-    print("=" * 118)
+    print("=" * 124)
     accept: dict[str, Any] = {}
     for label, point, offsets in arms:
         accept[label] = acceptance(calib, members[point], band, offsets)
@@ -426,7 +456,7 @@ def report_acceptance(
             )
             verdict = "PASS" if a["pass"] else "FAIL"
             print(
-                f"{'':<28s}-> {verdict}: {a['n_in_band']}/{a['n_months']} months in band, "
+                f"{'':<34s}-> {verdict}: {a['n_in_band']}/{a['n_months']} months in band, "
                 f"range {a['min']:.2f}-{a['max']:.2f}, worst {a['worst_month']}\n"
             )
     return accept
@@ -440,9 +470,9 @@ def main(cfg: DictConfig) -> None:
     x_dim_col = dataset_cfg["x_dim_column"] or "x"
     y_dim_col = dataset_cfg["y_dim_column"] or "y"
 
-    model = TTTSWIGAN.load_from_checkpoint(
-        model_cfg["checkpoint_path"], loss_fn="l1", device=device
-    )
+    # Built WITH the coherent channel whatever the checkpoint holds, so every amplitude on the
+    # grid is reachable on one model; the gains only exist here, the grid sets their values.
+    model = load_with_coherent_channel(model_cfg["checkpoint_path"], loss_fn="l1", device=device)
     model.statistics = dict(np.load(model_cfg["train_dataset_statistics_path"]))
     model.eval()
     target_std = single_channel_statistic(model.statistics, "targets_std")
@@ -473,14 +503,22 @@ def main(cfg: DictConfig) -> None:
     member_seed = int(sel["member_seed"])
     dropout = bool(model_cfg["dropout"])
     band = (float(sel["band"][0]), float(sel["band"][1]))
+    # Absent from an older config, the amplitude axis is the single point 0.0: the channel off,
+    # which is the grid this tool always ran.
+    amplitudes = [
+        None if a is None else float(a) for a in sel.get("coherent_amplitudes", None) or [0.0]
+    ]
     grid: list[Point] = list(
         itertools.product(
-            [int(k) for k in sel["neutral_members"]], [float(s) for s in sel["state_sd"]]
+            amplitudes,
+            [int(k) for k in sel["neutral_members"]],
+            [float(s) for s in sel["state_sd"]],
         )
     )
     if SHIPPED not in grid:
         raise ValueError(
-            "the grid must contain neutral_members=0, state_sd=0 -- the shipped ensemble"
+            "the grid must contain coherent_amplitude=0, neutral_members=0, state_sd=0 -- "
+            "the shipped ensemble"
         )
     calib_years = [int(y) for y in sel["calibration_years"]]
     calib = [rasters.window(y) for y in calib_years]
@@ -489,10 +527,10 @@ def main(cfg: DictConfig) -> None:
     selection_seeds = [int(s) for s in sel["selection_seeds"]]
     evaluation_seeds = [int(s) for s in sel["evaluation_seeds"]]
 
-    def run(window: dict[str, Any], k: int, sd: float, seed: int) -> np.ndarray:
+    def run(window: dict[str, Any], point: Point, seed: int) -> np.ndarray:
         with dropout_active(model, dropout):
             return rollout_window(
-                model, rasters, window, num_members, k, sd, member_seed, seed, noise_std, device
+                model, rasters, window, num_members, point, member_seed, seed, noise_std, device
             )
 
     logger.info(
@@ -515,7 +553,7 @@ def main(cfg: DictConfig) -> None:
         SHIPPED: offsets_for(members, SHIPPED, calib),
         best: offsets_for(members, best, calib),
     }
-    selected_label = f"selected k={best[0]} sd={best[1]}"
+    selected_label = f"selected a={amplitude_label(best[0])} k={best[1]} sd={best[2]}"
     arms: list[tuple[str, Point, np.ndarray | None]] = [
         ("shipped", SHIPPED, None),
         ("shipped + offset", SHIPPED, offsets[SHIPPED]),
@@ -531,10 +569,11 @@ def main(cfg: DictConfig) -> None:
     out_dir = Path(cfg["output"]["directory"])
     out_dir.mkdir(parents=True, exist_ok=True)
     spec = dispersion_spec(
-        best[0],
         best[1],
+        best[2],
         offsets[best],
         member_seed,
+        coherent_amplitude=best[0],
         offsets_units="SWI",
         checkpoint=str(model_cfg["checkpoint_path"]),
         selected_on=(
@@ -546,18 +585,21 @@ def main(cfg: DictConfig) -> None:
     )
     spec_path = out_dir / "state_dispersion.json"
     save_dispersion_spec(spec, spec_path)
+
+    def point_fields(point: Point) -> dict[str, Any]:
+        return {"coherent_amplitude": point[0], "neutral_members": point[1], "state_sd": point[2]}
+
     results = {
         "grid": [
             {
-                "neutral_members": k,
-                "state_sd": sd,
-                **{f"raw_{a}": b for a, b in table[(k, sd)]["raw"].items()},
-                **{f"corrected_{a}": b for a, b in table[(k, sd)]["corrected"].items()},
+                **point_fields(point),
+                **{f"raw_{a}": b for a, b in table[point]["raw"].items()},
+                **{f"corrected_{a}": b for a, b in table[point]["corrected"].items()},
             }
-            for k, sd in grid
+            for point in grid
         ],
-        "selected": {"neutral_members": best[0], "state_sd": best[1]},
-        "raw_argmin": {"neutral_members": best_raw[0], "state_sd": best_raw[1]},
+        "selected": point_fields(best),
+        "raw_argmin": point_fields(best_raw),
         "seasonal_offsets": {
             "shipped": offsets[SHIPPED].tolist(),
             "selected": offsets[best].tolist(),

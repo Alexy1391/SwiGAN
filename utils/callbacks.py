@@ -11,6 +11,7 @@ from matplotlib import colors
 from pytorch_lightning import LightningModule
 from torch.utils.data import Dataset
 
+from utils.batchnorm_recalibration import recalibrate_batchnorm
 from utils.rollout import score_rollout
 
 logger = logging.getLogger(__file__)
@@ -31,6 +32,60 @@ MONTHS = [
 ]
 
 
+class BatchNormRecalibrationCallback(Callback):
+    """Recalibrate the generator's BatchNorm on the training split before anything scores it.
+
+    Runs at the start of every validation epoch, before the first batch, so the teacher-forced
+    ``val/generator_rmse``, the free-running ``val/rollout_rmse`` that
+    :class:`RolloutMetricsCallback` logs and ``ModelCheckpoint`` ranks on, and the figures all
+    normalize by statistics that describe the weights rather than whichever batches happened to
+    end the epoch -- see :mod:`utils.batchnorm_recalibration`. ``ModelCheckpoint`` writes after
+    the validation loop and before the next optimizer step, so every checkpoint carries these
+    statistics too, and so does anything that loads one. The same happens at the start of
+    ``trainer.test``.
+
+    Training is untouched: train mode normalizes by the batch and never reads the running
+    statistics, and the pass runs on its own RNG stream.
+    """
+
+    def __init__(
+        self, dataset: Dataset, batch_size: int, num_passes: int = 1, seed: int = 0
+    ) -> None:
+        """Initialize the callback.
+
+        Args:
+        ----
+            dataset: The training split.
+            batch_size: The training batch size.
+            num_passes: Passes over the training split per recalibration.
+            seed: Seed of the pass's private RNG stream, held fixed across epochs like the
+                rollout's so that a move in the curve is a move in the weights.
+
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_passes = num_passes
+        self.seed = seed
+
+    def _recalibrate(self, pl_module: LightningModule) -> None:
+        recalibrate_batchnorm(
+            pl_module,
+            self.dataset,
+            batch_size=self.batch_size,
+            num_passes=self.num_passes,
+            seed=self.seed,
+            device=pl_module.device,
+        )
+
+    def on_validation_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Recalibrate before the validation batches, the rollout and the checkpoint save."""
+        self._recalibrate(pl_module)
+
+    def on_test_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Recalibrate before ``trainer.test`` scores the model."""
+        self._recalibrate(pl_module)
+
+
 class RolloutMetricsCallback(Callback):
     """Log the FREE-RUNNING rollout error of the validation and test splits during training.
 
@@ -49,6 +104,11 @@ class RolloutMetricsCallback(Callback):
     The rollout runs on a private RNG stream and restores the global one, so it does not shift
     the draws the training steps consume: turning the metric on does not perturb the run it is
     measuring.
+
+    The rollout runs in eval mode, so it normalizes by the generator's BatchNorm running
+    statistics. With ``batchnorm_recalibration.enabled`` those were recalibrated at the start of
+    the same validation epoch by :class:`BatchNormRecalibrationCallback`; without it they are a
+    draw of the last training batches, worth about +-0.05 on a region the size of BFC.
     """
 
     def __init__(

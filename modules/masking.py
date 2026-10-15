@@ -505,7 +505,15 @@ class MaskedBatchNorm2d(nn.BatchNorm2d):
         running_mean, running_var = self.running_mean, self.running_var
         if self.training or running_mean is None or running_var is None:
             mean, var, count = masked_batch_statistics(values, mask)
-            if self.training and running_mean is not None and running_var is not None:
+            # ``track_running_stats=False`` in train mode normalizes by the batch and leaves
+            # the buffers alone, as in ``_BatchNorm.forward``: it is how
+            # ``modules.batchnorm.frozen_running_statistics`` keeps a pass out of them.
+            if (
+                self.training
+                and self.track_running_stats
+                and running_mean is not None
+                and running_var is not None
+            ):
                 with torch.no_grad():
                     # Bessel's correction against the cells that contributed, not B*H*W.
                     unbiased = var * count / (count - 1.0).clamp_min(1.0)

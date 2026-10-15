@@ -1,12 +1,12 @@
-experiment_name: "swigan_corse_batch_size_64_1000"
+experiment_name: "swigan_limousin_batch_size_64"
 
 dataset:
-  filepath: "Outputs/rcp_8.5/Corse/data_train.parquet"
+  filepath: "Outputs/rcp_8.5/Limousin/data_train.parquet"
   # Chronological splits shipped as separate files: train 1960-2021, val 2022-2023,
   # test 2024-2025. Set both to null to fall back to splitting `filepath` with
   # train_ratio/val_ratio below, which is what the legacy "Grand Est/" layout needs.
-  val_filepath: "Outputs/rcp_8.5/Corse/data_val.parquet"
-  test_filepath: "Outputs/rcp_8.5/Corse/data_test.parquet"
+  val_filepath: "Outputs/rcp_8.5/Limousin/data_val.parquet"
+  test_filepath: "Outputs/rcp_8.5/Limousin/data_test.parquet"
   # The splits are contiguous, so seed val/test with the last `input_steps` months of the
   # preceding split as SWI history. Those months are only ever fed as context and are never
   # scored, so the 24-month val and test splits yield 24 samples instead of 16.
@@ -25,12 +25,15 @@ dataset:
     - "tasmaxAdjust"
     - "tasminAdjust"
   target_column: "swi_u"
-  # (height, width) of the region's 8 km grid. Every rcp_8.5 region sits on the same
-  # projection, only the extent differs: Corse is 23 x 11 (253 cells, 140 inside the
-  # region), Grand Est 36 x 44 (1584 cells, 894 inside). A wrong size silently drops every
-  # month. The generator pads any grid up to 48x48 internally; the critics are fully
+  # (height, width) of the region's 8 km grid, i.e. (number of distinct y, number of
+  # distinct x): rows are sorted by y then x, so x varies fastest. Every rcp_8.5 region sits
+  # on the same projection, only the extent differs: Corse is 23 x 11 (253 cells, 140 inside
+  # the region), Bretagne 20 x 35 (700 cells, 428 inside), Grand Est 36 x 44 (1584 cells, 894
+  # inside). A wrong size silently drops every month -- and a transposed one drops nothing:
+  # (35, 20) has the same cell count as (20, 35) and trains on scrambled, striped maps.
+  # The generator pads any grid up to 48x48 internally; the critics are fully
   # convolutional and derive their tile grid from this size.
-  map_dimensions: (23, 11)
+  map_dimensions: (20, 18)
   x_dim_column: null
   y_dim_column: null
 
@@ -209,6 +212,24 @@ rollout:
   # null = the whole split (24 months for val and test here).
   num_steps: null
 
+# Recalibrate the generator's BatchNorm running statistics at the start of every validation
+# epoch and of `trainer.test`: reset them and average them over the training split, in train
+# mode, with every sample counted once (utils/batchnorm_recalibration.py). Without it the running
+# statistics are dominated by the last training batches of the epoch, and on the 500-epoch
+# Bourgogne-Franche-Comte run that swung val/rollout_rmse by +-0.05 from one epoch to the next --
+# the same weights trained twice from one checkpoint scored 0.171 and 0.222 -- so checkpoint
+# selection mostly ranked those draws. Checkpoints are saved after validation, so they carry the
+# recalibrated statistics. Training itself is unchanged. false scores with the stored
+# statistics, as every run before 2026-09-23 did.
+batchnorm_recalibration:
+  enabled: true
+  # One pass is 12 forward passes on 736 samples, ~1.2 s on a T4. On BFC five seeds of one pass
+  # spread val rollout RMSE by s.d. 0.004-0.005 (0.053 across stored statistics); 4 passes bring
+  # that to 0.001-0.002 at ~5 s per validation epoch.
+  num_passes: 1
+  # Held fixed across epochs, like rollout.seed.
+  seed: 0
+
 logging:
   # What ModelCheckpoint ranks `save_top_k` on. "val/rollout_rmse" selects on the free-running
   # error, which is the quantity the paper reports and the one that stops improving first;
@@ -216,7 +237,7 @@ logging:
   # to set this back to when `rollout.enabled` is false.
   checkpoint_monitor: "val/rollout_rmse"
   save_checkpoint_every_n_epoch: 5
-  save_top_k_checkpoints: 40
+  save_top_k_checkpoints: 20
   save_directory: null
   log_every_n_steps: 1
   log_figures_every_n_epochs: 20

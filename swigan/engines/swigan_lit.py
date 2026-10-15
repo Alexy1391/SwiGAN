@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa
 from lightning import LightningModule
 from torch import autograd, nn
 
+from modules.batchnorm import frozen_running_statistics
 from modules.discriminator.base_discriminator import BaseDiscriminator
 from modules.discriminator.frame_discriminator import FrameDiscriminator
 from modules.discriminator.patch_gan_discriminator import PatchGANDiscriminator
@@ -870,13 +871,17 @@ class TTTSWIGAN(LightningModule):
             batch["mask"],
         )
         device = input_maps.device
-        # Generate fake images
-        fake_imgs = self(
-            input_maps=input_maps,
-            input_timestamps=input_timestamps,
-            mask=mask,
-            noise_vector=z,
-        )
+        # Generate fake images. Still normalized by the batch, but kept out of the generator's
+        # BatchNorm running statistics: this pass repeats ``num_critic_iterations_per_epoch``
+        # times on the same batch, and writing each one made the last batch of an epoch 47% of
+        # the statistics every eval-mode score normalizes with (see ``modules/batchnorm.py``).
+        with frozen_running_statistics(self.generator):
+            fake_imgs = self(
+                input_maps=input_maps,
+                input_timestamps=input_timestamps,
+                mask=mask,
+                noise_vector=z,
+            )
         fake_imgs = fake_imgs.detach()
 
         # Where the critics score: the native grid, or the canvas the generator padded to.

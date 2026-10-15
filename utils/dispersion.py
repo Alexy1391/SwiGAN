@@ -24,6 +24,13 @@ mean's RMSE on 7 of 7 windows at spread-skill 0.88-1.12, where the gain paid 22%
 width. See ``outputs/2026-09-16/arm_comparison/`` and the report section "Widen the state,
 not the noise".
 
+A THIRD KNOB, INSIDE THE GENERATOR. ``coherent_amplitude`` is not a state perturbation: it is
+the gain of the generator's spatially coherent noise channel (:mod:`utils.coherent_channel`),
+which produces the same whole-field displacement from inside the model that the state knobs
+bolt on from outside. It rides in the spec because ``utils/dispersion_select.py`` selects all
+three on the same windows and because the two families overlap -- given the channel, the
+selection stops asking for a state perturbation.
+
 Both transforms are applied to the INPUT COPY of the history buffer at every step -- see
 ``swigan.inference.compute_trajectory_iterative``'s ``history_scale`` / ``history_shift`` --
 so a member's own predictions are never rescaled twice.
@@ -151,13 +158,20 @@ def dispersion_spec(
     state_sd: float,
     seasonal_offsets: np.ndarray | None,
     member_seed: int = DEFAULT_MEMBER_SEED,
+    coherent_amplitude: float | None = None,
     **provenance: Any,
 ) -> dict[str, Any]:
-    """Build the dictionary ``swigan/inference.py`` consumes, JSON-serialisable."""
+    """Build the dictionary ``swigan/inference.py`` consumes, JSON-serialisable.
+
+    ``coherent_amplitude`` is the generator-side knob of :mod:`utils.coherent_channel`, chosen
+    on the same windows as the two state knobs: a constant for every coherent gain, 0.0 for the
+    channel off, or None to leave whatever gains the checkpoint carries alone.
+    """
     return {
         "neutral_members": int(neutral_members),
         "state_sd": float(state_sd),
         "member_seed": int(member_seed),
+        "coherent_amplitude": None if coherent_amplitude is None else float(coherent_amplitude),
         "seasonal_offsets": None
         if seasonal_offsets is None
         else [float(v) for v in np.asarray(seasonal_offsets).reshape(-1)],
@@ -172,6 +186,10 @@ def load_dispersion_spec(source: str | Path | dict[str, Any]) -> dict[str, Any]:
         if key not in spec:
             raise ValueError(f"dispersion spec is missing '{key}'")
     spec.setdefault("member_seed", DEFAULT_MEMBER_SEED)
+    # A spec written before the coherent channel had a selected amplitude means "whatever
+    # gains the checkpoint carries", which is what those specs were scored with -- not the
+    # channel off, which would detach a fine-tuned channel the spec was selected against.
+    spec.setdefault("coherent_amplitude", None)
     spec.setdefault("seasonal_offsets", None)
     if spec["seasonal_offsets"] is not None and len(spec["seasonal_offsets"]) != 12:
         raise ValueError("seasonal_offsets must hold 12 values or be null")

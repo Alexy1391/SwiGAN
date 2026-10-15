@@ -216,3 +216,20 @@ def test_spec_round_trips_through_json_and_is_validated(tmp_path: Path) -> None:
     path.write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="12 values"):
         load_dispersion_spec(path)
+
+
+def test_the_coherent_amplitude_rides_in_the_spec(tmp_path: Path) -> None:
+    """The selected amplitude reaches inference, and an older spec does not detach a channel.
+
+    Every spec written before the amplitude was selected -- including the one selected against
+    the fine-tuned channel -- was scored with the checkpoint's own gains. Reading a missing
+    field as 0.0 would detach that channel at inference and ship something never scored.
+    """
+    path = tmp_path / "spec.json"
+    save_dispersion_spec(dispersion_spec(6, 0.0, None, coherent_amplitude=0.15), path)
+    assert load_dispersion_spec(path)["coherent_amplitude"] == 0.15
+    save_dispersion_spec(dispersion_spec(6, 0.0, None, coherent_amplitude=0.0), path)
+    assert load_dispersion_spec(path)["coherent_amplitude"] == 0.0
+    older = {"neutral_members": 4, "state_sd": 0.6}
+    assert load_dispersion_spec(older)["coherent_amplitude"] is None
+    assert dispersion_spec(4, 0.6, None)["coherent_amplitude"] is None

@@ -229,3 +229,20 @@ events.out.tfevents.*
 *.sh
 swigan_round*
 swigan_paper*
+
+# Data and run artefacts (keep only code in the repo)
+swigan_*/
+pricing/dep_*/
+pricing/cache/
+pricing/output/
+*.csv
+*.csvt
+*.prj
+*.geojson
+*.xml
+*.npz
+*.npy
+*.png
+*.pdf
+*.html
+*.tar.gz
