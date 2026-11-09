@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Extraction des maisons individuelles depuis les exports CSV de la BDNB.
 
-Pour chaque département disponible sous ``pricing/dep_<code>/csv/``, on
+Pour chaque département disponible sous ``pricing/bdnb_grand_est/dep_<code>/csv/``
+(ou ``pricing/dep_<code>/csv/`` pour l'ancienne disposition), on
 reconstitue une ligne par maison individuelle avec ses caractéristiques
 structurantes pour un modèle de prix : nombre de niveaux, emprise au sol,
 année de construction.
@@ -39,6 +40,8 @@ import duckdb
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "output"
+# Exports BDNB : regroupés sous bdnb_grand_est/, à la racine de pricing/ avant.
+BDNB = ROOT / "bdnb_grand_est" if (ROOT / "bdnb_grand_est").is_dir() else ROOT
 
 # Départements de la région Grand Est (INSEE).
 GRAND_EST = ["08", "10", "51", "52", "54", "55", "57", "67", "68", "88"]
@@ -115,7 +118,7 @@ def discover_departements(root: Path) -> list[str]:
 
 def extract_departement(con: duckdb.DuckDBPyConnection, code: str) -> str:
     """Construit la table ``maisons_<code>`` et renvoie son nom."""
-    csv_dir = ROOT / f"dep_{code}" / "csv"
+    csv_dir = BDNB / f"dep_{code}" / "csv"
     missing = [t for t in REQUIRED_TABLES if not (csv_dir / f"{t}.csv").exists()]
     if missing:
         raise FileNotFoundError(f"dep {code}: tables manquantes {missing}")
@@ -334,9 +337,9 @@ def main() -> int:
         aggregate(con_agg, args.output_dir)
         return 0
 
-    available = discover_departements(ROOT)
+    available = discover_departements(BDNB)
     if not available:
-        print(f"Aucun export BDNB trouvé sous {ROOT}/dep_*/csv/", file=sys.stderr)
+        print(f"Aucun export BDNB trouvé sous {BDNB}/dep_*/csv/", file=sys.stderr)
         return 1
 
     deps = args.dep or available

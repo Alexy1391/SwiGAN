@@ -235,6 +235,7 @@ swigan_*/
 pricing/dep_*/
 pricing/cache/
 pricing/output/
+pricing/dvf/
 *.csv
 *.csvt
 *.prj

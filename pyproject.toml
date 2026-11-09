@@ -41,6 +41,19 @@ dev = [
   "seaborn >=0.13.2",
   "ipywidgets >=8.1.0, <9"
 ]
+# Scripts de pricing/ (sinistres, coûts CatNat sécheresse). pymc reste en 5.x :
+# nutpie l'échantillonne par numba, faute de compilateur C++ sous Windows.
+pricing = [
+  "duckdb >= 1.1",
+  "geopandas >= 1.0",
+  "shapely >= 2.0",
+  "scipy >= 1.13",
+  "statsmodels >= 0.14",
+  "pymc >= 5.20, <6",
+  "arviz >= 0.20, <1",
+  "nutpie >= 0.15",
+  "numba >= 0.61"
+]
 
 [tool.ruf.lint.pydocstyle]
 convention = "google"
